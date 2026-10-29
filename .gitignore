@@ -1,0 +1,62 @@
+# Byte-compiled / optimized / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.pytest_cache/
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables, credentials & secrets
+.env
+.env.*
+!.env.example
+config.local.json
+*.pem
+*.key
+
+# SQLite Databases & WAL files
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Temporary directories, logs & media cache
+bot_cache/
+temp/
+tmp/
+logs/
+*.log
+bot_audit.log
+
+# Project backups, patches and legacy scripts
+*.bak
+*.clean_bak
+*.pre_github_bak
+bot_backup*
+bot_v_*
+bot_test.py
+bot1.py
+apply_master_patch.py
+fix_*
+master_fix*
+reset_block*
+upgrade_ai*
+prepare_github_release.py
+
+# IDE & OS files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
