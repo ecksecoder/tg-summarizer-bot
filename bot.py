@@ -1,11 +1,10 @@
 """
 AI Context Hub — Enterprise Multi-Modal Telegram Assistant.
 
-Asynchronous content ingestion, multi-tier web scraping, document/audio parsing,
-and resilient multi-model LLM summarization powered by aiogram 3.x and SQLite WAL.
+Asynchronous content ingestion, native Google AI web summarization,
+document/audio parsing, and resilient multi-model LLM summarization powered
+by aiogram 3.x and SQLite WAL.
 """
-
-#       aiohttp, beautifulsoup4, pypdf, python-docx
 
 import os
 import re
@@ -34,13 +33,13 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-import aiohttp
-from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from docx import Document
 
 from google import genai
 from google.genai import types
+
+from parser import parse_and_summarize_url, LinkSummaryResponse
 
 
 load_dotenv()
@@ -360,135 +359,15 @@ def extract_text_from_txt(file_path: str) -> str:
         return clean_extracted_text(f.read())
 
 
-def _parse_html_clean(html_text: str) -> str:
-    """Strip boilerplate DOM nodes and extract primary article text and metadata."""
-    soup = BeautifulSoup(html_text, "html.parser")
-    title = soup.title.string.strip() if (soup.title and soup.title.string) else ""
-
-    meta_desc = ""
-    for meta in soup.find_all("meta"):
-        prop = (meta.get("property") or meta.get("name") or "").lower()
-        if prop in ("description", "og:description", "twitter:description"):
-            content = (meta.get("content") or "").strip()
-            if len(content) > len(meta_desc):
-                meta_desc = content
-
-    for tag in soup([
-        "script", "style", "noscript", "header", "footer",
-        "nav", "aside", "form", "iframe", "svg", "button"
-    ]):
-        tag.decompose()
-
-    main_node = soup.find("article") or soup.find("main") or soup.body or soup
-    body_text = main_node.get_text(separator="\n")
-
-    parts = []
-    if title:
-        parts.append(f"ЗАГОЛОВОК СТРАНИЦЫ: {title}")
-    if meta_desc:
-        parts.append(f"КРАТКОЕ ОПИСАНИЕ (META): {meta_desc}")
-    if body_text:
-        parts.append(body_text)
-
-    return clean_extracted_text("\n\n".join(parts))
-
-
-async def fetch_url_text(url: str) -> str:
-    """Multi-tier web extractor: Jina Reader -> Direct Chrome TLS -> CORS Proxy fallback."""
-    safe, reason = is_safe_url(url)
-    if not safe:
-        raise ValueError(f"Заблокировано системой безопасности: {reason}")
-
-    clean_url = url.strip()
-    if "t.me/" in clean_url and "/s/" not in clean_url:
-        clean_url = re.sub(r"https?://t\.me/([^/]+)/(\d+)", r"https://t.me/s/\1/\2", clean_url)
-    elif "github.com/" in clean_url and "/blob/" in clean_url:
-        clean_url = clean_url.replace("github.com/", "raw.githubusercontent.com/").replace("/blob/", "/")
-
-    browser_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Cache-Control": "no-cache",
-    }
-
-    timeout_cfg = aiohttp.ClientTimeout(total=22, connect=8)
-    connector = aiohttp.TCPConnector(ssl=False)
-
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout_cfg) as session:
-        try:
-            jina_url = f"https://r.jina.ai/{clean_url}"
-            jina_headers = {
-                **browser_headers,
-                "X-Return-Format": "markdown",
-                "X-Remove-Selector": "nav, footer, header, aside, .cookie, #cookie"
-            }
-            async with session.get(jina_url, headers=jina_headers) as resp:
-                if resp.status == 200:
-                    raw_jina = await resp.text(errors="ignore")
-                    cleaned = clean_extracted_text(raw_jina)
-                    if len(cleaned) >= 90 and "Access Denied" not in cleaned[:200]:
-                        logger.info(f"[URL OK] Эшелон 1 (Jina) извлёк: {clean_url}")
-                        return cleaned[:120000]
-        except Exception as e:
-            logger.warning(f"[URL Эшелон 1] Сбой Jina для {clean_url}: {e}")
-
-        try:
-            async with session.get(clean_url, headers=browser_headers, allow_redirects=True) as resp:
-                if resp.status == 200:
-                    html_text = await resp.text(errors="ignore")
-                    parsed_text = await asyncio.to_thread(_parse_html_clean, html_text)
-                    if len(parsed_text) >= 50:
-                        logger.info(f"[URL OK] Эшелон 2 (Direct Chrome) извлёк: {clean_url}")
-                        return parsed_text[:120000]
-        except Exception as e:
-            logger.warning(f"[URL Эшелон 2] Сбой прямого входа {clean_url}: {e}")
-
-        try:
-            md_url = f"https://markdown.new/{clean_url}"
-            async with session.get(md_url, headers=browser_headers) as resp:
-                if resp.status == 200:
-                    md_text = clean_extracted_text(await resp.text(errors="ignore"))
-                    if len(md_text) >= 80:
-                        logger.info(f"[URL OK] Эшелон 3 (Markdown.new) извлёк: {clean_url}")
-                        return md_text[:120000]
-        except Exception as e:
-            logger.warning(f"[URL Эшелон 3] Сбой Markdown.new для {clean_url}: {e}")
-
-        try:
-            from urllib.parse import quote
-            proxy_url = f"https://api.allorigins.win/raw?url={quote(clean_url, safe='')}"
-            async with session.get(proxy_url, headers=browser_headers) as resp:
-                if resp.status == 200:
-                    html_text = await resp.text(errors="ignore")
-                    parsed_text = await asyncio.to_thread(_parse_html_clean, html_text)
-                    if len(parsed_text) >= 50:
-                        logger.info(f"[URL OK] Эшелон 4 (AllOrigins) извлёк: {clean_url}")
-                        return parsed_text[:120000]
-        except Exception as e:
-            logger.warning(f"[URL Эшелон 4] Сбой AllOrigins для {clean_url}: {e}")
-
-        try:
-            from urllib.parse import quote
-            ct_url = f"https://api.codetabs.com/v1/proxy?quest={quote(clean_url, safe='')}"
-            async with session.get(ct_url, headers=browser_headers) as resp:
-                if resp.status == 200:
-                    html_text = await resp.text(errors="ignore")
-                    parsed_text = await asyncio.to_thread(_parse_html_clean, html_text)
-                    if len(parsed_text) >= 50:
-                        logger.info(f"[URL OK] Эшелон 5 (CodeTabs) извлёк: {clean_url}")
-                        return parsed_text[:120000]
-        except Exception as e:
-            logger.warning(f"[URL Эшелон 5] Сбой CodeTabs для {clean_url}: {e}")
-
-    raise RuntimeError(
-        "Сайт защищён жёсткой капчей (Cloudflare Turnstile / авторизация) "
-        "или не содержит текстового контента."
+async def fetch_url_text(url: str, format_size: str = "MEDIUM") -> str:
+    """Delegate URL extraction and summarization to Google GenAI native processor."""
+    result = await parse_and_summarize_url(
+        url=url,
+        format_size=format_size,
+        client=ai_client,
+        model=PRIMARY_PRIMARY_GEMINI_MODEL,
     )
+    return result.summary
 
 
 FORMAT_LABELS = {
@@ -829,10 +708,16 @@ async def process_user_queue(user_id: int, bot: Bot):
                         None, summarize_with_gemini, raw_text, source_title, format_size, False
                     )
                 elif source_type == "url":
-                    raw_text = await fetch_url_text(task["url"])
-                    summary = await loop.run_in_executor(
-                        None, summarize_with_gemini, raw_text, source_title, format_size, False
+                    link_res = await parse_and_summarize_url(
+                        url=task["url"],
+                        format_size=format_size,
+                        client=ai_client,
+                        model=PRIMARY_PRIMARY_GEMINI_MODEL,
                     )
+                    summary = link_res.summary
+                    raw_text = link_res.raw_text or link_res.summary
+                    if link_res.title:
+                        source_title = link_res.title
                 elif source_type in ("pdf", "docx", "txt"):
                     file_path = task["file_path"]
                     if source_type == "pdf":
