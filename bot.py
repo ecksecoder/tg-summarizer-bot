@@ -42,6 +42,19 @@ from google.genai import types
 from parser import parse_and_summarize_url, LinkSummaryResponse
 
 
+from config import (
+    ALLOWED_USER_IDS,
+    BOT_TOKEN,
+    DB_PATH,
+    DEFAULT_GEMINI_MODEL,
+    GEMINI_API_KEYS,
+    MAX_FILE_SIZE_BYTES,
+    MAX_FILE_SIZE_MB,
+    SLIDING_WINDOW_RAW_LIMIT,
+    TEMP_DIR,
+)
+from llm_router import get_client, is_resource_exhausted, rotate
+
 load_dotenv()
 
 logging.basicConfig(
@@ -55,29 +68,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AIContextHub")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+PRIMARY_PRIMARY_GEMINI_MODEL = DEFAULT_GEMINI_MODEL
 
-PRIMARY_PRIMARY_GEMINI_MODEL = "gemini-3.8-flash".strip()
+if not BOT_TOKEN or not GEMINI_API_KEYS:
+    logger.critical("ОШИБКА КОНФИГУРАЦИИ: Не заданы BOT_TOKEN или GEMINI_API_KEYS в файле .env!")
+    raise SystemExit("Заполните BOT_TOKEN и GEMINI_API_KEYS в файле .env перед запуском.")
 
-RAW_ALLOWED_IDS = os.getenv("ALLOWED_USER_IDS", "").strip()
-ALLOWED_USER_IDS: set[int] = {
-    int(uid.strip()) for uid in RAW_ALLOWED_IDS.split(",") if uid.strip().isdigit()
-}
-
-MAX_FILE_SIZE_MB = 20
-MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-SLIDING_WINDOW_RAW_LIMIT = 10
-
-DB_PATH = "context_hub.db"
-TEMP_DIR = os.path.join(tempfile.gettempdir(), "ai_context_hub_temp")
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-if not BOT_TOKEN or not GEMINI_API_KEY:
-    logger.critical("ОШИБКА КОНФИГУРАЦИИ: Не заданы BOT_TOKEN или GEMINI_API_KEY в файле .env!")
-    raise SystemExit("Заполните BOT_TOKEN и GEMINI_API_KEY в файле .env перед запуском.")
-
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+ai_client = get_client()
 
 SAFETY_OFF = [
     types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
@@ -364,7 +361,6 @@ async def fetch_url_text(url: str, format_size: str = "MEDIUM") -> str:
     result = await parse_and_summarize_url(
         url=url,
         format_size=format_size,
-        client=ai_client,
         model=PRIMARY_PRIMARY_GEMINI_MODEL,
     )
     return result.summary
@@ -455,12 +451,11 @@ def _call_gemini_with_fallback(contents, temperature: float = 0.25) -> str:
 
     is_plain_text = isinstance(contents, str)
     groq_key = os.getenv("GROQ_API_KEY", "").strip().strip('"').strip("'")
-    gemini_key = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
 
-    if gemini_key:
+    if GEMINI_API_KEYS:
         google_models = ["gemini-3-flash-preview", "gemini-3.1-flash-lite-preview"]
         try:
-            for m in ai_client.models.list():
+            for m in get_client().models.list():
                 m_name = str(getattr(m, "name", "") or "").replace("models/", "")
                 low = m_name.lower()
                 if ("gemini" in low or "gemma" in low) and not any(
@@ -473,8 +468,9 @@ def _call_gemini_with_fallback(contents, temperature: float = 0.25) -> str:
 
         for model_name in google_models[:4]:
             try:
+                active_ai_client = get_client()
                 logger.info(f"[Дверь 1: Google] Пробую {model_name}...")
-                resp = ai_client.models.generate_content(
+                resp = active_ai_client.models.generate_content(
                     model=model_name,
                     contents=contents,
                     config=types.GenerateContentConfig(temperature=temperature, safety_settings=SAFETY_OFF)
@@ -484,6 +480,8 @@ def _call_gemini_with_fallback(contents, temperature: float = 0.25) -> str:
                     return resp.text.strip()
             except Exception as e:
                 logger.warning(f"[Дверь 1: Google] {model_name} пропуск: {e}")
+                if is_resource_exhausted(e):
+                    rotate()
                 time.sleep(0.8)
 
     if is_plain_text and groq_key:
@@ -711,7 +709,6 @@ async def process_user_queue(user_id: int, bot: Bot):
                     link_res = await parse_and_summarize_url(
                         url=task["url"],
                         format_size=format_size,
-                        client=ai_client,
                         model=PRIMARY_PRIMARY_GEMINI_MODEL,
                     )
                     summary = link_res.summary
@@ -1300,6 +1297,8 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
+    # Flush backlog of stale Telegram updates before polling to avoid self-DDOS
+    await bot.delete_webhook(drop_pending_updates=True)
     logger.info("🚀 Бот AI Context Hub v2.3 Enterprise успешно запущен!")
     await dp.start_polling(bot)
 
