@@ -14,6 +14,7 @@ import sqlite3
 import tempfile
 import ipaddress
 from datetime import datetime
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -53,7 +54,19 @@ from config import (
     SLIDING_WINDOW_RAW_LIMIT,
     TEMP_DIR,
 )
-from llm_router import get_client, is_resource_exhausted, rotate
+from llm_router import (
+    FORMAT_INSTRUCTIONS,
+    FORMAT_LABELS,
+    UNIFIED_EXECUTIVE_SYSTEM_PROMPT,
+    _local_extractive_fallback,
+    _smart_compress_text,
+    default_router,
+    generate_executive_summary,
+    get_client,
+    is_resource_exhausted,
+    rotate,
+    summarize_with_gemini,
+)
 
 load_dotenv()
 
@@ -357,7 +370,7 @@ def extract_text_from_txt(file_path: str) -> str:
 
 
 async def fetch_url_text(url: str, format_size: str = "MEDIUM") -> str:
-    """Delegate URL extraction and summarization to Google GenAI native processor."""
+    """Delegate URL extraction and summarization to local parser and LLM cascade."""
     result = await parse_and_summarize_url(
         url=url,
         format_size=format_size,
@@ -391,9 +404,7 @@ FORMAT_INSTRUCTIONS = {
     ),
 }
 
-BASE_SYSTEM_PROMPT = """Ты — корпоративный аналитик и литературный редактор.
-Твоя задача — извлечь максимум пользы из материала БЕЗ ВОДЫ и общих фраз.
-Сразу переходи к сути! Язык ответа: Русский. Используй списки и жирный шрифт."""
+BASE_SYSTEM_PROMPT = UNIFIED_EXECUTIVE_SYSTEM_PROMPT
 
 
 def _smart_compress_text(text: str, max_chars: int = 22000) -> str:
@@ -433,161 +444,28 @@ def _local_extractive_fallback(raw_text: str, source_title: str) -> str:
     )
 
 
-def _http_post_json(url: str, headers: dict, payload_dict: dict, timeout: int = 40) -> dict:
-    """Execute _http_post_json workflow."""
-    import urllib.request
-    import json
-    data_bytes = json.dumps(payload_dict).encode("utf-8")
-    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8", errors="ignore"))
+def _call_gemini_with_fallback(contents: Any, temperature: float = 0.25) -> str:
+    """Execute LLM inference with automated key rotation, model cascade, and Groq fallback.
 
+    Args:
+        contents: Generation payload (string, list, or Part objects).
+        temperature: Sampling temperature for generation.
 
-def _call_gemini_with_fallback(contents, temperature: float = 0.25) -> str:
-    """Execute LLM inference with dynamic model discovery and automatic failover."""
-    import time
-    import json
-    import urllib.request
+    Returns:
+        str: Generated content string.
 
-    is_plain_text = isinstance(contents, str)
-    groq_key = os.getenv("GROQ_API_KEY", "").strip().strip('"').strip("'")
-
-    if GEMINI_API_KEYS:
-        google_models = ["gemini-3-flash-preview", "gemini-3.1-flash-lite-preview"]
-        try:
-            for m in get_client().models.list():
-                m_name = str(getattr(m, "name", "") or "").replace("models/", "")
-                low = m_name.lower()
-                if ("gemini" in low or "gemma" in low) and not any(
-                    x in low for x in ("1.5", "2.0", "2.5", "embedding", "imagen", "veo", "tts", "audio", "vision", "live")
-                ):
-                    if m_name not in google_models:
-                        google_models.append(m_name)
-        except Exception:
-            pass
-
-        for model_name in google_models[:4]:
-            try:
-                active_ai_client = get_client()
-                logger.info(f"[Дверь 1: Google] Пробую {model_name}...")
-                resp = active_ai_client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(temperature=temperature, safety_settings=SAFETY_OFF)
-                )
-                if resp and resp.text:
-                    logger.info(f"[Дверь 1: Google] УСПЕХ ({model_name})!")
-                    return resp.text.strip()
-            except Exception as e:
-                logger.warning(f"[Дверь 1: Google] {model_name} пропуск: {e}")
-                if is_resource_exhausted(e):
-                    rotate()
-                time.sleep(0.8)
-
-    if is_plain_text and groq_key:
-        safe_prompt = _smart_compress_text(contents, max_chars=18000)
-        groq_models = []
-        try:
-            req = urllib.request.Request(
-                "https://api.groq.com/openai/v1/models",
-                headers={
-                    "Authorization": f"Bearer {groq_key}",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0",
-                },
-                method="GET",
-            )
-            with urllib.request.urlopen(req, timeout=10) as r:
-                items = json.loads(r.read().decode("utf-8")).get("data", [])
-                for it in items:
-                    mid = str(it.get("id", "")).strip()
-                    if mid and not any(w in mid.lower() for w in ("whisper", "guard", "tts", "playai", "vision")):
-                        groq_models.append(mid)
-        except Exception as e:
-            logger.warning(f"[Дверь 2: Groq Радар] Ошибка списка моделей: {e}")
-
-        for gm in groq_models[:4]:
-            try:
-                logger.info(f"[Дверь 2: Groq] Пробую модель {gm}...")
-                data = _http_post_json(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {groq_key}",
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0",
-                    },
-                    payload_dict={
-                        "model": gm,
-                        "messages": [{"role": "user", "content": safe_prompt}],
-                        "temperature": temperature,
-                    },
-                )
-                ans = data["choices"][0]["message"]["content"].strip()
-                if ans:
-                    logger.info(f"[Дверь 2: Groq] УСПЕХ ({gm})!")
-                    return ans
-            except Exception as e:
-                logger.warning(f"[Дверь 2: Groq] {gm} отказ: {e}")
-
-    if is_plain_text:
-        try:
-            logger.info("[Дверь 3: Резервный Облачный ИИ без ключа] Отправка запроса...")
-            cloud_prompt = _smart_compress_text(contents, max_chars=14000)
-            data = _http_post_json(
-                "https://text.pollinations.ai/openai",
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0",
-                },
-                payload_dict={
-                    "model": "openai",
-                    "messages": [{"role": "user", "content": cloud_prompt}],
-                    "temperature": temperature,
-                },
-                timeout=45,
-            )
-            ans = data["choices"][0]["message"]["content"].strip()
-            if ans:
-                logger.info("[Дверь 3: Резервный Облачный ИИ] УСПЕХ!")
-                return ans
-        except Exception as e:
-            logger.warning(f"[Дверь 3: Резервный ИИ] Пропуск: {e}")
-
-    raise RuntimeError("Облачные шлюзы не ответили.")
-
-
-def summarize_with_gemini(
-    raw_text: str,
-    source_title: str,
-    format_size: str = "MEDIUM",
-    retry_variation: bool = False
-) -> str:
-    """Generate structured content summary according to the target compression tier."""
-    if not raw_text or len(raw_text.strip()) < 10:
-        return "⚠️ Не удалось извлечь достаточный объём текста из источника."
-
-    fmt_key = format_size if format_size in FORMAT_INSTRUCTIONS else "MEDIUM"
-    size_prompt = FORMAT_INSTRUCTIONS[fmt_key]
-    prepared_text = _smart_compress_text(raw_text, max_chars=22000)
-
-    variation_note = (
-        "\nВНИМАНИЕ: Это повторная переработка! Сделай акцент на других деталях.\n"
-        if retry_variation else ""
-    )
-
-    full_prompt = (
-        f"{BASE_SYSTEM_PROMPT}\n\n"
-        f"{size_prompt}\n"
-        f"{variation_note}\n"
-        f"ИСТОЧНИК: {source_title}\n"
-        f"--- НАЧАЛО МАТЕРИАЛА ---\n{prepared_text}\n--- КОНЕЦ МАТЕРИАЛА ---"
-    )
-
-    temp = 0.55 if retry_variation else 0.25
+    Raises:
+        RuntimeError: If all cascade options and failovers fail.
+    """
     try:
-        return _call_gemini_with_fallback(full_prompt, temperature=temp)
-    except Exception as e:
-        logger.warning(f"[Аварийный перехват] Включаю локальный анализатор для {source_title}: {e}")
-        return _local_extractive_fallback(raw_text, source_title)
+        response = default_router.generate_content_sync(
+            contents=contents,
+            temperature=temperature,
+        )
+        return str(response).strip()
+    except Exception as exc:
+        logger.error("[LLM Cascade] Synchronous generation error: %s", exc)
+        raise RuntimeError(f"All LLM cascade tiers failed: {exc}") from exc
 
 
 def process_audio_with_gemini(
@@ -702,8 +580,11 @@ async def process_user_queue(user_id: int, bot: Bot):
             try:
                 if source_type == "text":
                     raw_text = clean_extracted_text(task["raw_text"])
-                    summary = await loop.run_in_executor(
-                        None, summarize_with_gemini, raw_text, source_title, format_size, False
+                    summary = await generate_executive_summary(
+                        raw_text=raw_text,
+                        source_title=source_title,
+                        format_size=format_size,
+                        retry_variation=False,
                     )
                 elif source_type == "url":
                     link_res = await parse_and_summarize_url(
@@ -724,8 +605,11 @@ async def process_user_queue(user_id: int, bot: Bot):
                     else:
                         raw_text = await loop.run_in_executor(None, extract_text_from_txt, file_path)
 
-                    summary = await loop.run_in_executor(
-                        None, summarize_with_gemini, raw_text, source_title, format_size, False
+                    summary = await generate_executive_summary(
+                        raw_text=raw_text,
+                        source_title=source_title,
+                        format_size=format_size,
+                        retry_variation=False,
                     )
                 elif source_type == "audio":
                     summary = await loop.run_in_executor(
@@ -1158,10 +1042,12 @@ async def review_regenerate_or_change_format(callback: CallbackQuery):
         f"🔄 Перестраиваю выжимку для «{source_title}» -> [{fmt_badge}]..."
     )
 
-    loop = asyncio.get_running_loop()
     try:
-        new_summary = await loop.run_in_executor(
-            None, summarize_with_gemini, base_material, source_title, new_fmt, is_variation
+        new_summary = await generate_executive_summary(
+            raw_text=base_material,
+            source_title=source_title,
+            format_size=new_fmt,
+            retry_variation=is_variation,
         )
 
         async with aiosqlite.connect(DB_PATH) as db:
@@ -1297,9 +1183,9 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Flush backlog of stale Telegram updates before polling to avoid self-DDOS
-    await bot.delete_webhook(drop_pending_updates=True)
     logger.info("🚀 Бот AI Context Hub v2.3 Enterprise успешно запущен!")
+    # Flush backlog of stale Telegram updates immediately before polling
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 

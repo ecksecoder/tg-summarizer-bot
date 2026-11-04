@@ -1,10 +1,8 @@
-"""Unit tests for the Google GenAI web parser and summarizer module."""
+"""Unit tests for the local web parser, HTML text extractor, and URL summarizer."""
 
 import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
-
-from google.genai import types
 
 from parser import (
     FORMAT_INSTRUCTIONS,
@@ -12,7 +10,10 @@ from parser import (
     _extract_grounding_metadata,
     _extract_key_points,
     _extract_title,
+    clean_extracted_text,
+    extract_clean_text_from_html,
     fetch_url_text,
+    fetch_webpage_content,
     is_safe_url,
     parse_and_summarize_url,
 )
@@ -53,6 +54,51 @@ class TestUrlSafetyValidation(unittest.TestCase):
         self.assertFalse(safe)
 
 
+class TestHtmlTextExtraction(unittest.TestCase):
+    """Test local HTML tag stripping, script/style removal, and truncation."""
+
+    def test_strip_scripts_styles_and_extract_title(self):
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Enterprise AI Architecture 2026</title>
+            <script>alert('malicious tracker');</script>
+            <style>body { background: #fff; }</style>
+        </head>
+        <body>
+            <header><nav><a href="/">Home</a></nav></header>
+            <main>
+                <h1>Main Heading</h1>
+                <p>This is the primary substantive article paragraph detailing system metrics.</p>
+                <aside><p>Sidebar fluff and related ads</p></aside>
+            </main>
+            <footer><p>Copyright 2026</p></footer>
+        </body>
+        </html>
+        """
+        title, clean_text = extract_clean_text_from_html(html)
+        self.assertEqual(title, "Enterprise AI Architecture 2026")
+        self.assertIn("This is the primary substantive article paragraph", clean_text)
+        self.assertNotIn("alert('malicious tracker')", clean_text)
+        self.assertNotIn("background: #fff", clean_text)
+        self.assertNotIn("Sidebar fluff", clean_text)
+        self.assertNotIn("Copyright 2026", clean_text)
+
+    def test_truncation_safely_at_20000_chars(self):
+        massive_body = "<p>" + ("A" * 30000) + "</p>"
+        html = f"<html><head><title>Huge Page</title></head><body>{massive_body}</body></html>"
+        title, clean_text = extract_clean_text_from_html(html)
+        self.assertEqual(title, "Huge Page")
+        self.assertLessEqual(len(clean_text), 20000)
+
+    def test_clean_extracted_text_normalizes_whitespace(self):
+        raw = "Line 1   with   spaces\n\n\n\n\nLine 2\n\n\nLine 3"
+        cleaned = clean_extracted_text(raw)
+        self.assertNotIn("\n\n\n", cleaned)
+        self.assertIn("Line 1 with spaces", cleaned)
+
+
 class TestLinkSummaryResponseModel(unittest.TestCase):
     """Test LinkSummaryResponse container behavior."""
 
@@ -64,12 +110,14 @@ class TestLinkSummaryResponseModel(unittest.TestCase):
             key_points=["Key insight 1", "Key insight 2"],
             format_size="MEDIUM",
             model="gemini-3.8-flash",
+            raw_text="Extracted plain text sample",
         )
         self.assertEqual(res.url, "https://example.com")
         self.assertEqual(res.title, "Sample Article")
         self.assertEqual(str(res), res.summary)
         self.assertEqual(res.to_display_text(), res.summary)
         self.assertEqual(len(res.key_points), 2)
+        self.assertEqual(res.raw_text, "Extracted plain text sample")
 
 
 class TestHelperExtractors(unittest.TestCase):
@@ -119,88 +167,54 @@ class TestHelperExtractors(unittest.TestCase):
 
 
 class TestParseAndSummarizeUrl(unittest.IsolatedAsyncioTestCase):
-    """Test asynchronous URL summarization with native Google GenAI client."""
+    """Test asynchronous URL local fetching and LLM executive summary pipeline."""
 
     async def test_unsafe_url_rejection(self):
         with self.assertRaises(ValueError):
             await parse_and_summarize_url("http://127.0.0.1:8000/secret")
 
-    async def test_native_async_client_flow(self):
-        mock_genai_response = MagicMock()
-        mock_genai_response.text = (
-            "# Artificial Intelligence Updates\n\n"
-            "This is a high quality summary.\n\n"
-            "- First core point of substance\n"
-            "- Second core point of substance"
-        )
-        mock_genai_response.candidates = []
-
-        mock_client = MagicMock()
-        mock_client.aio = MagicMock()
-        mock_client.aio.models = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(return_value=mock_genai_response)
-
-        result = await parse_and_summarize_url(
-            url="https://example.com/ai-update",
-            format_size="SHORT",
-            client=mock_client,
-            model="gemini-3.8-flash",
-            use_search_grounding=True,
+    @patch("parser.fetch_webpage_content")
+    async def test_local_fetch_and_llm_pipeline(self, mock_fetch):
+        mock_fetch.return_value = (
+            "Test Article Title",
+            "This is the clean plain text extracted from local HTML stripping.",
         )
 
-        mock_client.aio.models.generate_content.assert_awaited_once()
-        call_kwargs = mock_client.aio.models.generate_content.call_args.kwargs
-        self.assertEqual(call_kwargs["model"], "gemini-3.8-flash")
-        config = call_kwargs["config"]
-        self.assertIsInstance(config, types.GenerateContentConfig)
-        self.assertIsNotNone(config.tools)
-        self.assertIsInstance(config.tools[0].google_search, types.GoogleSearch)
-
-        self.assertIsInstance(result, LinkSummaryResponse)
-        self.assertEqual(result.title, "Artificial Intelligence Updates")
-        self.assertEqual(result.format_size, "SHORT")
-        self.assertEqual(len(result.key_points), 2)
-
-    async def test_sync_client_thread_fallback(self):
-        mock_genai_response = MagicMock()
-        mock_genai_response.text = "# Sync Fallback Article\n\n- Key takeaway one"
-        mock_genai_response.candidates = []
-
-        mock_client = MagicMock(spec=["models"])
-        mock_client.models.generate_content.return_value = mock_genai_response
-
-        result = await parse_and_summarize_url(
-            url="https://example.com/fallback-test",
-            client=mock_client,
+        mock_summary = (
+            "🎯 **Главная суть:**\nСтатья описывает внедрение AI.\n\n"
+            "📊 **Ключевые факты:**\n- Флагманская модель 3.8\n- Скорость выросла на 40%\n\n"
+            "💡 **Практические выводы:**\nОбновить шлюзы маршрутизации."
         )
 
-        mock_client.models.generate_content.assert_called_once()
-        self.assertEqual(result.title, "Sync Fallback Article")
-
-    async def test_empty_response_raises_runtime_error(self):
-        mock_genai_response = MagicMock()
-        mock_genai_response.text = "   "
-        mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(return_value=mock_genai_response)
-
-        with self.assertRaises(RuntimeError):
-            await parse_and_summarize_url(
-                url="https://example.com/empty",
-                client=mock_client,
+        with patch("parser.generate_executive_summary", AsyncMock(return_value=mock_summary)):
+            result = await parse_and_summarize_url(
+                url="https://example.com/ai-article",
+                format_size="MEDIUM",
             )
 
-    async def test_fetch_url_text_bridge(self):
-        mock_genai_response = MagicMock()
-        mock_genai_response.text = "Clean summary text output"
-        mock_genai_response.candidates = []
+        mock_fetch.assert_awaited_once_with("https://example.com/ai-article")
+        self.assertIsInstance(result, LinkSummaryResponse)
+        self.assertEqual(result.title, "Test Article Title")
+        self.assertEqual(result.summary, mock_summary)
+        self.assertIn("Флагманская модель 3.8", result.key_points)
+        self.assertEqual(result.raw_text, "This is the clean plain text extracted from local HTML stripping.")
 
-        mock_client = MagicMock()
-        mock_client.aio.models.generate_content = AsyncMock(return_value=mock_genai_response)
+    @patch("parser.fetch_webpage_content")
+    async def test_empty_response_raises_runtime_error(self, mock_fetch):
+        mock_fetch.return_value = ("Sample Title", "Some article text")
 
-        with patch("parser.genai.Client", return_value=mock_client):
-            with patch.dict("os.environ", {"GEMINI_API_KEY": "fake_test_key"}):
-                text = await fetch_url_text("https://example.com/bridge")
-                self.assertEqual(text, "Clean summary text output")
+        with patch("parser.generate_executive_summary", AsyncMock(return_value="   ")):
+            with self.assertRaises(RuntimeError):
+                await parse_and_summarize_url("https://example.com/empty-summary")
+
+    @patch("parser.fetch_webpage_content")
+    async def test_fetch_url_text_bridge(self, mock_fetch):
+        mock_fetch.return_value = ("Bridge Title", "Bridge extracted content")
+
+        mock_summary = "🎯 **Главная суть:** Результат моста."
+        with patch("parser.generate_executive_summary", AsyncMock(return_value=mock_summary)):
+            text = await fetch_url_text("https://example.com/bridge")
+            self.assertEqual(text, mock_summary)
 
 
 if __name__ == "__main__":

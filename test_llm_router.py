@@ -1,4 +1,4 @@
-"""Comprehensive unit tests for KeyManager, LLMRouter, and startup queue flush."""
+"""Comprehensive unit tests for KeyManager, LLMRouter, cascade, and startup flush."""
 
 import asyncio
 import os
@@ -13,6 +13,10 @@ from llm_router import (
     AllKeysExhaustedError,
     KeyManager,
     LLMRouter,
+    UNIFIED_EXECUTIVE_SYSTEM_PROMPT,
+    _local_extractive_fallback,
+    generate_executive_summary,
+    get_model_cascade,
     is_resource_exhausted,
     mask_api_key,
 )
@@ -119,8 +123,32 @@ class TestKeyManager(unittest.TestCase):
         self.assertEqual(mask_api_key("AIzaSyD1234567890Xyz"), "AIza...0Xyz")
 
 
+class TestModelCascadeAndErrorHandling(unittest.TestCase):
+    """Test model cascade ordering and 429/503 error detection."""
+
+    def test_cascade_order_and_deduplication(self):
+        # Primary is 3.8-flash: cascade is [3.8-flash, 2.5-flash, 2.0-flash]
+        cascade = get_model_cascade("gemini-3.8-flash")
+        self.assertEqual(cascade, ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.0-flash"])
+
+        # Primary is already 2.5-flash: no duplicate
+        cascade_dedup = get_model_cascade("gemini-2.5-flash")
+        self.assertEqual(cascade_dedup, ["gemini-2.5-flash", "gemini-2.0-flash"])
+
+    def test_is_resource_exhausted_detector(self):
+        mock_429 = errors.ClientError(429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}})
+        mock_503 = errors.ServerError(503, {"error": {"code": 503, "status": "UNAVAILABLE"}})
+
+        self.assertTrue(is_resource_exhausted(mock_429))
+        self.assertTrue(is_resource_exhausted(mock_503))
+        self.assertTrue(is_resource_exhausted(RuntimeError("HTTP 429 RESOURCE_EXHAUSTED")))
+        self.assertTrue(is_resource_exhausted(RuntimeError("503 UNAVAILABLE High Demand")))
+        self.assertFalse(is_resource_exhausted(ValueError("Bad arguments")))
+        self.assertFalse(is_resource_exhausted(RuntimeError("Unknown syntax error")))
+
+
 class TestLLMRouter(unittest.IsolatedAsyncioTestCase):
-    """Test async LLMRouter retry loops, 429 rotation, and failure policies."""
+    """Test async LLMRouter retry loops, 429/503 rotation, and Groq fallback."""
 
     def setUp(self):
         self.mock_429 = errors.ClientError(
@@ -133,22 +161,24 @@ class TestLLMRouter(unittest.IsolatedAsyncioTestCase):
                 }
             },
         )
-
-    def test_is_resource_exhausted_detector(self):
-        self.assertTrue(is_resource_exhausted(self.mock_429))
-        self.assertTrue(is_resource_exhausted(RuntimeError("HTTP 429 RESOURCE_EXHAUSTED")))
-        self.assertFalse(is_resource_exhausted(ValueError("Bad arguments")))
-        self.assertFalse(is_resource_exhausted(RuntimeError("Network timeout")))
+        self.mock_503 = errors.ServerError(
+            503,
+            {
+                "error": {
+                    "code": 503,
+                    "message": "This model is currently experiencing high demand.",
+                    "status": "UNAVAILABLE",
+                }
+            },
+        )
 
     async def test_instant_retry_on_429_masks_error(self):
         km = KeyManager(keys=["key_fail", "key_success"])
         router = LLMRouter(key_manager=km)
 
-        # Mock client for key_fail raising 429
         failing_client = MagicMock()
         failing_client.aio.models.generate_content = AsyncMock(side_effect=self.mock_429)
 
-        # Mock client for key_success succeeding
         success_response = MagicMock()
         success_response.text = "Success after rotation"
         succeeding_client = MagicMock()
@@ -160,28 +190,53 @@ class TestLLMRouter(unittest.IsolatedAsyncioTestCase):
         response = await router.generate_content(
             model="gemini-3.8-flash",
             contents="test prompt",
+            fallback_to_groq=False,
         )
 
         self.assertEqual(response.text, "Success after rotation")
         failing_client.aio.models.generate_content.assert_awaited_once()
         succeeding_client.aio.models.generate_content.assert_awaited_once()
 
-    async def test_all_keys_exhausted_raises_graceful_exception(self):
+    async def test_all_keys_exhausted_raises_graceful_exception_when_groq_fails(self):
         km = KeyManager(keys=["key_1", "key_2", "key_3"])
-        router = LLMRouter(key_manager=km)
+        router = LLMRouter(key_manager=km, groq_api_key="mock_groq")
 
         for k in km.get_all_keys():
             client_mock = MagicMock()
             client_mock.aio.models.generate_content = AsyncMock(side_effect=self.mock_429)
             km._clients[k] = client_mock
 
-        with self.assertRaises(AllKeysExhaustedError) as ctx:
-            await router.generate_content(
+        with patch("llm_router.call_groq_api", AsyncMock(side_effect=RuntimeError("Groq offline"))):
+            with self.assertRaises(AllKeysExhaustedError) as ctx:
+                await router.generate_content(
+                    model="gemini-3.8-flash",
+                    contents="test prompt",
+                    fallback_to_groq=True,
+                )
+
+            self.assertIn("exhausted", str(ctx.exception).lower())
+
+    async def test_groq_fallback_triggered_when_gemini_keys_fail(self):
+        km = KeyManager(keys=["key_1", "key_2"])
+        router = LLMRouter(key_manager=km, groq_api_key="mock_groq")
+
+        for k in km.get_all_keys():
+            client_mock = MagicMock()
+            client_mock.aio.models.generate_content = AsyncMock(side_effect=self.mock_429)
+            km._clients[k] = client_mock
+
+        with patch("llm_router.call_groq_api", AsyncMock(return_value="Groq fallback summary text")) as mock_groq:
+            response = await router.generate_content(
                 model="gemini-3.8-flash",
-                contents="test prompt",
+                contents="Extracted clean plain text article",
+                fallback_to_groq=True,
             )
 
-        self.assertIn("exhausted by rate limits", str(ctx.exception))
+            self.assertEqual(response.text, "Groq fallback summary text")
+            self.assertEqual(response.provider, "groq")
+            mock_groq.assert_awaited_once()
+            call_kwargs = mock_groq.call_args.kwargs
+            self.assertIn("Extracted clean plain text article", call_kwargs["prompt"])
 
     async def test_non_429_error_raises_immediately_without_rotation(self):
         km = KeyManager(keys=["key_1", "key_2"])
@@ -200,12 +255,18 @@ class TestLLMRouter(unittest.IsolatedAsyncioTestCase):
             await router.generate_content(
                 model="gemini-3.8-flash",
                 contents="bad prompt",
+                fallback_to_groq=False,
             )
 
-        # key_2 should never have been called because ValueError is not 429
         other_client.aio.models.generate_content.assert_not_called()
 
-    async def test_parser_integration_masks_429(self):
+    @patch("parser.fetch_webpage_content")
+    async def test_parser_integration_masks_429(self, mock_fetch):
+        mock_fetch.return_value = (
+            "Extracted Article",
+            "This is the clean text from page.\n- Key fact 1\n- Key fact 2",
+        )
+
         km = KeyManager(keys=["key_url_1", "key_url_2"])
         router = LLMRouter(key_manager=km)
 
@@ -213,7 +274,7 @@ class TestLLMRouter(unittest.IsolatedAsyncioTestCase):
         client1.aio.models.generate_content = AsyncMock(side_effect=self.mock_429)
 
         client2_resp = MagicMock()
-        client2_resp.text = "# Extracted Article\n\n- Key fact 1\n- Key fact 2"
+        client2_resp.text = "🎯 **Главная суть:**\nСтатья.\n\n📊 **Ключевые факты:**\n- Key fact 1\n- Key fact 2\n\n💡 **Практические выводы:**\nДействие."
         client2_resp.candidates = []
         client2 = MagicMock()
         client2.aio.models.generate_content = AsyncMock(return_value=client2_resp)
@@ -230,6 +291,42 @@ class TestLLMRouter(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Key fact 1", result.key_points)
         client1.aio.models.generate_content.assert_awaited_once()
         client2.aio.models.generate_content.assert_awaited_once()
+
+    async def test_unified_executive_summary_prompt_structure(self):
+        self.assertIn("1. 🎯 Главная суть", UNIFIED_EXECUTIVE_SYSTEM_PROMPT)
+        self.assertIn("2. 📊 Ключевые факты", UNIFIED_EXECUTIVE_SYSTEM_PROMPT)
+        self.assertIn("3. 💡 Практические выводы", UNIFIED_EXECUTIVE_SYSTEM_PROMPT)
+
+        mock_router = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = (
+            "1. 🎯 Главная суть: Текст сути.\n"
+            "2. 📊 Ключевые факты:\n- Факт 1\n"
+            "3. 💡 Практические выводы:\n- Действие 1"
+        )
+        mock_router.generate_content = AsyncMock(return_value=mock_response)
+
+        res = await generate_executive_summary(
+            raw_text="Extracted text input for executive summary test.",
+            source_title="Test Doc",
+            format_size="MEDIUM",
+            router=mock_router,
+        )
+        self.assertIn("Главная суть", res)
+        mock_router.generate_content.assert_awaited_once()
+
+    async def test_extractive_fallback_only_when_both_gemini_and_groq_fail(self):
+        mock_router = MagicMock()
+        mock_router.generate_content = AsyncMock(side_effect=AllKeysExhaustedError("All exhausted"))
+
+        text = "This is a detailed paragraph of enterprise documentation with enough length to be extracted."
+        res = await generate_executive_summary(
+            raw_text=text,
+            source_title="Critical Failure Doc",
+            router=mock_router,
+        )
+        self.assertIn("Автономная структурная выжимка", res)
+        self.assertIn("Critical Failure Doc", res)
 
 
 class TestStartupFlush(unittest.IsolatedAsyncioTestCase):

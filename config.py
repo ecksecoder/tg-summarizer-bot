@@ -80,7 +80,8 @@ ADMIN_ID: str = os.getenv("ADMIN_ID", "").strip()
 ALLOWED_USER_IDS: set[int] = parse_allowed_user_ids()
 
 # Model preferences
-DEFAULT_GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+DEFAULT_GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip() or "gemini-3.8-flash"
+DEFAULT_GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 
 # System operational limits and paths
 MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", "20"))
