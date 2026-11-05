@@ -1,18 +1,17 @@
-"""
-AI Context Hub — Enterprise Multi-Modal Telegram Assistant.
+"""AI Context Hub — Enterprise Multi-Modal Telegram Assistant.
 
 Asynchronous content ingestion, native Google AI web summarization,
 document/audio parsing, and resilient multi-model LLM summarization powered
 by aiogram 3.x and SQLite WAL.
 """
 
+import asyncio
+import ipaddress
+import logging
 import os
 import re
-import asyncio
-import logging
 import sqlite3
 import tempfile
-import ipaddress
 from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -20,28 +19,24 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    FSInputFile,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 
-from pypdf import PdfReader
 from docx import Document
-
 from google import genai
 from google.genai import types
-
-from parser import parse_and_summarize_url, LinkSummaryResponse
-
+from pypdf import PdfReader
 
 from config import (
     ALLOWED_USER_IDS,
@@ -56,7 +51,6 @@ from config import (
 )
 from llm_router import (
     FORMAT_INSTRUCTIONS,
-    FORMAT_LABELS,
     UNIFIED_EXECUTIVE_SYSTEM_PROMPT,
     _local_extractive_fallback,
     _smart_compress_text,
@@ -64,9 +58,20 @@ from llm_router import (
     generate_executive_summary,
     get_client,
     is_resource_exhausted,
+    process_audio_with_gemini as router_process_audio,
     rotate,
+    summarize_text,
     summarize_with_gemini,
 )
+from locales import (
+    FORMAT_BADGES,
+    detect_locale,
+    get_button_variants,
+    get_format_badge,
+    get_language_inline_kb,
+    get_text,
+)
+from parser import LinkSummaryResponse, parse_and_summarize_url
 
 load_dotenv()
 
@@ -76,16 +81,16 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.FileHandler("bot_audit.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger("AIContextHub")
 
 PRIMARY_PRIMARY_GEMINI_MODEL = DEFAULT_GEMINI_MODEL
 
 if not BOT_TOKEN or not GEMINI_API_KEYS:
-    logger.critical("ОШИБКА КОНФИГУРАЦИИ: Не заданы BOT_TOKEN или GEMINI_API_KEYS в файле .env!")
-    raise SystemExit("Заполните BOT_TOKEN и GEMINI_API_KEYS в файле .env перед запуском.")
+    logger.critical("CONFIGURATION ERROR: BOT_TOKEN or GEMINI_API_KEYS not set in environment or .env!")
+    raise SystemExit("Fill in BOT_TOKEN and GEMINI_API_KEYS in .env before running.")
 
 ai_client = get_client()
 
@@ -115,154 +120,86 @@ def is_safe_url(url: str) -> tuple[bool, str]:
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
-            return False, "Разрешены только защищенные протоколы HTTP и HTTPS."
+            return False, "Only HTTP and HTTPS protocols are allowed."
 
         hostname = (parsed.hostname or "").lower()
         if not hostname or hostname in ("localhost", "0.0.0.0", "127.0.0.1", "::1"):
-            return False, "Доступ к локальным адресам заблокирован политикой безопасности."
+            return False, "Access to localhost addresses is restricted by security policy."
 
         path_lower = parsed.path.lower()
         dangerous_exts = (".exe", ".bat", ".cmd", ".sh", ".scr", ".pif", ".msi", ".jar", ".vbs")
         if any(path_lower.endswith(ext) for ext in dangerous_exts):
-            return False, "Скачивание исполняемых файлов по ссылкам запрещено."
+            return False, "Downloading executable files via links is forbidden."
 
         try:
             ip = ipaddress.ip_address(hostname)
             if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return False, "Внутренние и приватные IP-адреса заблокированы (Anti-SSRF)."
+                return False, "Internal and private network addresses are restricted (Anti-SSRF)."
         except ValueError:
             if hostname.endswith((".local", ".internal", ".lan", ".localhost")):
-                return False, "Запрещены обращения к внутренним локальным доменам."
+                return False, "Access to internal local domain names is prohibited."
 
         return True, "OK"
     except Exception as e:
-        return False, f"Некорректный формат URL: {e}"
+        return False, f"Malformed URL format: {e}"
 
 
-class _CursorContext:
-    def __init__(self, conn, sql, params):
-        self._conn, self._sql, self._params, self._cursor = conn, sql, params, None
-    async def _run(self):
-        self._cursor = await asyncio.to_thread(self._conn.execute, self._sql, self._params)
-        return self
-    def __await__(self):
-        return self._run().__await__()
-    async def __aenter__(self):
-        return await self._run()
-    async def __aexit__(self, t, v, tb):
-        if self._cursor: await asyncio.to_thread(self._cursor.close)
-    async def fetchone(self):
-        return await asyncio.to_thread(self._cursor.fetchone)
-    async def fetchall(self):
-        return await asyncio.to_thread(self._cursor.fetchall)
-    @property
-    def lastrowid(self):
-        return self._cursor.lastrowid if self._cursor else None
+from database import (
+    _CursorContext,
+    _DBConnectionContext,
+    _SQLiteCompat,
+    aiosqlite,
+    get_user_language,
+    init_db,
+    is_user_onboarded,
+    set_user_language,
+)
 
 
-class _DBConnectionContext:
-    """Async SQLite connection manager enforcing WAL mode and foreign keys."""
-    def __init__(self, db_path: str):
-        self._db_path = db_path
-        self._conn = None
+async def resolve_user_locale(user_id: int, telegram_lang: Optional[str] = None) -> tuple[str, bool]:
+    """Resolve active language and auto-detection flag for user.
 
-    def _open_and_configure(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=15.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
+    Checks DB:
+    - If DB language is set (e.g. 'en', 'uk', 'ru'), returns (lang, False).
+    - If DB language is NULL, returns (detect_locale(telegram_lang), True).
 
-    async def __aenter__(self):
-        self._conn = await asyncio.to_thread(self._open_and_configure)
-        return self
+    Args:
+        user_id: Telegram user ID.
+        telegram_lang: Language code from Telegram client profile.
 
-    async def __aexit__(self, exc_type, exc, tb):
-        if self._conn:
-            await asyncio.to_thread(self._conn.close)
-
-    def execute(self, sql: str, params: tuple = ()):
-        return _CursorContext(self._conn, sql, params)
-
-    async def commit(self):
-        await asyncio.to_thread(self._conn.commit)
+    Returns:
+        tuple[str, bool]: (resolved_language_code, is_auto)
+    """
+    db_lang = await get_user_language(user_id)
+    if db_lang:
+        return db_lang, False
+    return detect_locale(telegram_lang), True
 
 
-class _SQLiteCompat:
-    def connect(self, db_path: str):
-        return _DBConnectionContext(db_path)
+async def resolve_user_lang(user_id: int, telegram_lang: Optional[str] = None) -> str:
+    """Resolve active language for user, checking database first with fallback to Telegram locale."""
+    lang, _ = await resolve_user_locale(user_id, telegram_lang)
+    return lang
 
 
-aiosqlite = _SQLiteCompat()
-
-
-async def init_db():
-    """Initialize SQLite WAL schema and run idempotent column migrations."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS folders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS summaries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                folder_id INTEGER NOT NULL,
-                source_type TEXT NOT NULL,
-                source_title TEXT NOT NULL,
-                summary_text TEXT NOT NULL,
-                raw_text TEXT DEFAULT NULL,
-                format_size TEXT DEFAULT 'MEDIUM',
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (folder_id) REFERENCES folders (id) ON DELETE CASCADE
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS user_settings (
-                user_id INTEGER PRIMARY KEY,
-                active_folder_id INTEGER DEFAULT NULL,
-                default_format TEXT DEFAULT 'MEDIUM'
-            )
-        """)
-
-        async with db.execute("PRAGMA table_info(summaries)") as cursor:
-            cols = [row[1] for row in await cursor.fetchall()]
-        for col_name, col_def in (
-            ("folder_id", "INTEGER NOT NULL DEFAULT 1"),
-            ("source_type", "TEXT NOT NULL DEFAULT 'text'"),
-            ("source_title", "TEXT NOT NULL DEFAULT 'Материал'"),
-            ("summary_text", "TEXT NOT NULL DEFAULT ''"),
-            ("raw_text", "TEXT DEFAULT NULL"),
-            ("format_size", "TEXT DEFAULT 'MEDIUM'"),
-            ("created_at", "TEXT NOT NULL DEFAULT ''"),
-        ):
-            if col_name not in cols:
-                await db.execute(f"ALTER TABLE summaries ADD COLUMN {col_name} {col_def}")
-                logger.info(f"Миграция БД: добавлена колонка {col_name} в таблицу summaries.")
-
-        await db.commit()
-    logger.info("База данных SQLite (WAL) успешно инициализирована.")
-
-
-async def ensure_user_settings(user_id: int) -> tuple[int, str]:
-    """Retrieve or initialize default active folder and summary format for a user."""
+async def ensure_user_settings(user_id: int, lang: Optional[str] = None) -> tuple[int, str]:
+    """Retrieve or initialize default active folder, summary format, and language for a user."""
+    resolved_lang = lang or "en"
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT active_folder_id, default_format FROM user_settings WHERE user_id = ?",
-            (user_id,)
+            "SELECT active_folder_id, default_format, language FROM user_settings WHERE user_id = ?",
+            (user_id,),
         ) as cur:
             row = await cur.fetchone()
 
         default_format = row[1] if row and row[1] else "MEDIUM"
         active_folder_id = row[0] if row else None
+        current_lang = row[2] if row and len(row) > 2 and row[2] else None
 
         if active_folder_id:
             async with db.execute(
                 "SELECT id FROM folders WHERE id = ? AND user_id = ?",
-                (active_folder_id, user_id)
+                (active_folder_id, user_id),
             ) as cur:
                 if not await cur.fetchone():
                     active_folder_id = None
@@ -270,26 +207,38 @@ async def ensure_user_settings(user_id: int) -> tuple[int, str]:
         if not active_folder_id:
             async with db.execute(
                 "SELECT id FROM folders WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-                (user_id,)
+                (user_id,),
             ) as cur:
                 f_row = await cur.fetchone()
             if f_row:
                 active_folder_id = f_row[0]
             else:
                 now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                effective_lang = current_lang or resolved_lang
+                inbox_name = get_text("default_inbox_name", effective_lang)
                 async with db.execute(
                     "INSERT INTO folders (user_id, name, created_at) VALUES (?, ?, ?)",
-                    (user_id, "📥 Быстрый входящий", now)
+                    (user_id, inbox_name, now),
                 ) as cur:
                     active_folder_id = cur.lastrowid
 
-        await db.execute("""
-            INSERT INTO user_settings (user_id, active_folder_id, default_format)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                active_folder_id = excluded.active_folder_id,
-                default_format = excluded.default_format
-        """, (user_id, active_folder_id, default_format))
+        if row:
+            await db.execute(
+                """
+                UPDATE user_settings
+                SET active_folder_id = ?, default_format = ?
+                WHERE user_id = ?
+                """,
+                (active_folder_id, default_format, user_id),
+            )
+        else:
+            await db.execute(
+                """
+                INSERT INTO user_settings (user_id, active_folder_id, default_format, language)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, active_folder_id, default_format, current_lang),
+            )
         await db.commit()
         return active_folder_id, default_format
 
@@ -299,7 +248,7 @@ async def set_user_active_folder(user_id: int, folder_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE user_settings SET active_folder_id = ? WHERE user_id = ?",
-            (folder_id, user_id)
+            (folder_id, user_id),
         )
         await db.commit()
 
@@ -309,7 +258,7 @@ async def set_user_default_format(user_id: int, fmt: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE user_settings SET default_format = ? WHERE user_id = ?",
-            (fmt, user_id)
+            (fmt, user_id),
         )
         await db.commit()
 
@@ -317,7 +266,8 @@ async def set_user_default_format(user_id: int, fmt: str):
 async def prune_old_raw_texts(user_id: int):
     """Enforce sliding-window storage hygiene by pruning old raw_text payloads."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(f"""
+        await db.execute(
+            f"""
             UPDATE summaries
             SET raw_text = NULL
             WHERE id IN (
@@ -328,7 +278,9 @@ async def prune_old_raw_texts(user_id: int):
                 ORDER BY s.id DESC
                 LIMIT -1 OFFSET {SLIDING_WINDOW_RAW_LIMIT}
             )
-        """, (user_id,))
+            """,
+            (user_id,),
+        )
         await db.commit()
 
 
@@ -380,68 +332,12 @@ async def fetch_url_text(url: str, format_size: str = "MEDIUM") -> str:
 
 
 FORMAT_LABELS = {
-    "SHORT": "⚡ Шпаргалка",
-    "MEDIUM": "📋 Конспект",
-    "LONG": "📚 Пересказ",
-}
-
-FORMAT_INSTRUCTIONS = {
-    "SHORT": (
-        "ФОРМАТ ВЫВОДА: ⚡ ШПАРГАЛКА (МАКСИМАЛЬНО СЖАТО).\n"
-        "- Объём: строго 5–10 самых главных пунктов или цифр на один экран.\n"
-        "- Только сухая выжимка: ключевые события, выводы и факты без воды."
-    ),
-    "MEDIUM": (
-        "ФОРМАТ ВЫВОДА: 📋 СТРУКТУРИРОВАННЫЙ КОНСПЕКТ (СРЕДНИЙ ОБЪЁМ).\n"
-        "- Раздели материал на логические блоки с подзаголовками.\n"
-        "- Сохрани все важные факты, сюжетные линии, параметры и причинно-следственные связи."
-    ),
-    "LONG": (
-        "ФОРМАТ ВЫВОДА: 📚 ПОЛНЫЙ ДЕТАЛЬНЫЙ ПЕРЕСКАЗ (МАКСИМАЛЬНАЯ ГЛУБИНА).\n"
-        "- Подробно разбери каждый раздел или главу в хронологическом порядке.\n"
-        "- Сохрани все примеры, тонкости, героев и нюансы так, чтобы чтение пересказа "
-        "полностью заменяло чтение оригинала."
-    ),
+    "SHORT": "Cheat Sheet",
+    "MEDIUM": "Structured Summary",
+    "LONG": "In-Depth Retelling",
 }
 
 BASE_SYSTEM_PROMPT = UNIFIED_EXECUTIVE_SYSTEM_PROMPT
-
-
-def _smart_compress_text(text: str, max_chars: int = 22000) -> str:
-    """Execute _smart_compress_text workflow."""
-    if not text:
-        return ""
-    if len(text) <= max_chars:
-        return text
-
-    num_chunks = 10
-    chunk_size = max_chars // num_chunks
-    step = max(1, (len(text) - chunk_size) // (num_chunks - 1))
-
-    parts = []
-    for i in range(num_chunks):
-        start = i * step
-        snippet = text[start : start + chunk_size].strip()
-        pct = int((start / len(text)) * 100)
-        parts.append(f"--- [Часть {i+1}/{num_chunks} (~{pct}% книги)] ---\n{snippet}")
-
-    return (
-        f"[Масштабный документ ({len(text)} симв.). Равномерная выборка ключевых глав:]\n\n"
-        + "\n\n".join(parts)
-    )
-
-
-def _local_extractive_fallback(raw_text: str, source_title: str) -> str:
-    """Execute _local_extractive_fallback workflow."""
-    compressed = _smart_compress_text(raw_text, max_chars=6000)
-    paragraphs = [p.strip() for p in compressed.split("\n") if len(p.strip()) > 60]
-    selected = paragraphs[:18]
-    bullets = "\n\n".join(f"• {p[:350]}..." if len(p) > 350 else f"• {p}" for p in selected)
-    return (
-        f"⚡ **Автономная структурная выжимка (Режим высокой нагрузки облака)**\n"
-        f"📌 **Документ:** {source_title} (Объём оригинала: {len(raw_text)} симв.)\n\n"
-        f"{bullets}"
-    )
 
 
 def _call_gemini_with_fallback(contents: Any, temperature: float = 0.25) -> str:
@@ -472,54 +368,54 @@ def process_audio_with_gemini(
     file_path: str,
     mime_type: str,
     source_title: str,
-    format_size: str = "MEDIUM"
+    format_size: str = "MEDIUM",
+    target_lang: str = "en",
+    lang: Optional[str] = None,
 ) -> str:
-    """Upload audio stream via File API, generate summary, and clean up remote state."""
-    uploaded_file = None
-    try:
-        fmt_key = format_size if format_size in FORMAT_INSTRUCTIONS else "MEDIUM"
-        uploaded_file = ai_client.files.upload(
-            file=file_path,
-            config=types.UploadFileConfig(mime_type=mime_type)
-        )
-        prompt = (
-            f"{BASE_SYSTEM_PROMPT}\n\n"
-            f"{FORMAT_INSTRUCTIONS[fmt_key]}\n"
-            f"Прослушай эту аудиозапись ({source_title}) и сделай точную выжимку."
-        )
-        return _call_gemini_with_fallback([uploaded_file, prompt], temperature=0.25)
-    finally:
-        if uploaded_file:
-            try:
-                ai_client.files.delete(name=uploaded_file.name)
-            except Exception:
-                pass
+    """Upload audio stream via File API, generate summary in target_lang, and clean up remote state."""
+    effective_lang = target_lang or lang or "en"
+    return router_process_audio(
+        file_path=file_path,
+        mime_type=mime_type,
+        source_title=source_title,
+        format_size=format_size,
+        target_lang=effective_lang,
+        client=ai_client,
+        router=default_router,
+    )
 
 
 USER_QUEUES: dict[int, list[dict]] = {}
 ACTIVE_WORKERS: dict[int, bool] = {}
 
 
-def review_inline_kb(summary_id: int, current_format: str = "MEDIUM") -> InlineKeyboardMarkup:
+def review_inline_kb(
+    summary_id: int,
+    current_format: str = "MEDIUM",
+    lang: str = "en",
+) -> InlineKeyboardMarkup:
     """Build inline action and format-switching keyboard for completed summaries."""
     fmt_buttons = []
-    for fmt_code, label in FORMAT_LABELS.items():
-        prefix = "🔘 " if fmt_code == current_format else ""
+    for fmt_code in ("SHORT", "MEDIUM", "LONG"):
+        label = get_format_badge(fmt_code, lang)
+        prefix = "• " if fmt_code == current_format else ""
         fmt_buttons.append(
             InlineKeyboardButton(
                 text=f"{prefix}{label}",
-                callback_data=f"rev_fmt_{summary_id}_{fmt_code}"
+                callback_data=f"rev_fmt_{summary_id}_{fmt_code}",
             )
         )
 
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Ок (Оставить)", callback_data=f"rev_ok_{summary_id}"),
-            InlineKeyboardButton(text="🔄 Переделать", callback_data=f"rev_regen_{summary_id}"),
-            InlineKeyboardButton(text="❌ Удалить", callback_data=f"rev_del_{summary_id}"),
-        ],
-        fmt_buttons
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=get_text("btn_keep", lang), callback_data=f"rev_ok_{summary_id}"),
+                InlineKeyboardButton(text=get_text("btn_regenerate", lang), callback_data=f"rev_regen_{summary_id}"),
+                InlineKeyboardButton(text=get_text("btn_delete", lang), callback_data=f"rev_del_{summary_id}"),
+            ],
+            fmt_buttons,
+        ]
+    )
 
 
 async def send_smart_summary_with_review(
@@ -528,23 +424,25 @@ async def send_smart_summary_with_review(
     header: str,
     summary_text: str,
     summary_id: int,
-    format_size: str = "MEDIUM"
+    format_size: str = "MEDIUM",
+    lang: str = "en",
 ):
     """Deliver long summaries in paginated chunks and attach review controls."""
     full_msg = f"{header}\n\n{summary_text}"
     max_len = 3800
-    kb = review_inline_kb(summary_id, format_size)
+    kb = review_inline_kb(summary_id, format_size, lang)
 
     if len(full_msg) <= max_len:
         await bot.send_message(chat_id, full_msg, reply_markup=kb)
     else:
-        chunks = [full_msg[i:i + max_len] for i in range(0, len(full_msg), max_len)]
+        chunks = [full_msg[i : i + max_len] for i in range(0, len(full_msg), max_len)]
         for idx, chunk in enumerate(chunks):
-            is_last = (idx == len(chunks) - 1)
+            is_last = idx == len(chunks) - 1
+            chunk_msg = get_text("msg_part", lang, current=idx + 1, total=len(chunks), chunk=chunk)
             await bot.send_message(
                 chat_id,
-                f"📄 Часть {idx + 1}/{len(chunks)}:\n\n{chunk}",
-                reply_markup=kb if is_last else None
+                chunk_msg,
+                reply_markup=kb if is_last else None,
             )
             await asyncio.sleep(0.3)
 
@@ -568,12 +466,19 @@ async def process_user_queue(user_id: int, bot: Bot):
             source_type = task["source_type"]
             source_title = task["source_title"]
             format_size = task.get("format_size", "MEDIUM")
-            fmt_badge = FORMAT_LABELS.get(format_size, "📋 Конспект")
+            # Worker locale isolation: fetch user language and auto flag from DB
+            lang, _ = await resolve_user_locale(user_id, task.get("telegram_lang") or task.get("lang"))
+            fmt_badge = get_format_badge(format_size, lang)
 
             status_msg = await bot.send_message(
                 chat_id,
-                f"⚙️ Обрабатываю: {source_title} [{fmt_badge}]...\n"
-                f"(В очереди ещё: {remaining})"
+                get_text(
+                    "status_processing",
+                    lang,
+                    source_title=source_title,
+                    format_badge=fmt_badge,
+                    remaining=remaining,
+                ),
             )
 
             raw_text = None
@@ -585,12 +490,14 @@ async def process_user_queue(user_id: int, bot: Bot):
                         source_title=source_title,
                         format_size=format_size,
                         retry_variation=False,
+                        target_lang=lang,
                     )
                 elif source_type == "url":
                     link_res = await parse_and_summarize_url(
                         url=task["url"],
                         format_size=format_size,
                         model=PRIMARY_PRIMARY_GEMINI_MODEL,
+                        target_lang=lang,
                     )
                     summary = link_res.summary
                     raw_text = link_res.raw_text or link_res.summary
@@ -610,6 +517,7 @@ async def process_user_queue(user_id: int, bot: Bot):
                         source_title=source_title,
                         format_size=format_size,
                         retry_variation=False,
+                        target_lang=lang,
                     )
                 elif source_type == "audio":
                     summary = await loop.run_in_executor(
@@ -618,11 +526,12 @@ async def process_user_queue(user_id: int, bot: Bot):
                         task["file_path"],
                         task["mime_type"],
                         source_title,
-                        format_size
+                        format_size,
+                        lang,
                     )
                     raw_text = summary
                 else:
-                    summary = "⚠️ Неизвестный формат данных."
+                    summary = get_text("error_unknown_format", lang)
 
                 now = datetime.now().strftime("%Y-%m-%d %H:%M")
                 async with aiosqlite.connect(DB_PATH) as db:
@@ -632,7 +541,7 @@ async def process_user_queue(user_id: int, bot: Bot):
                         (folder_id, source_type, source_title, summary_text, raw_text, format_size, created_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (folder_id, source_type, source_title, summary, raw_text, format_size, now)
+                        (folder_id, source_type, source_title, summary, raw_text, format_size, now),
                     ) as cursor:
                         summary_id = cursor.lastrowid
                     await db.commit()
@@ -644,14 +553,14 @@ async def process_user_queue(user_id: int, bot: Bot):
                 except Exception:
                     pass
 
-                header = f"✅ Выжимка сохранена [{fmt_badge}]\n📌 Источник: {source_title}"
+                header = get_text("header_summary_saved", lang, format_badge=fmt_badge, source_title=source_title)
                 await send_smart_summary_with_review(
-                    bot, chat_id, header, summary, summary_id, format_size
+                    bot, chat_id, header, summary, summary_id, format_size, lang
                 )
 
             except Exception as e:
-                logger.error(f"Ошибка при обработке '{source_title}': {e}")
-                await status_msg.edit_text(f"❌ Не удалось обработать «{source_title}». Детали записаны в журнал аудита.")
+                logger.error(f"Error processing '{source_title}': {e}")
+                await status_msg.edit_text(get_text("error_processing", lang, source_title=source_title))
 
             finally:
                 file_path = task.get("file_path")
@@ -675,82 +584,248 @@ class HubStates(StatesGroup):
     waiting_for_input = State()
 
 
-def main_menu_kb() -> ReplyKeyboardMarkup:
+def main_menu_kb(lang: str = "en") -> ReplyKeyboardMarkup:
+    """Generate dynamic persistent menu keyboard based on user language."""
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📁 Мои папки"), KeyboardButton(text="➕ Создать папку")],
-            [KeyboardButton(text="📥 Загрузить материалы"), KeyboardButton(text="📐 Формат выжимки")],
+            [
+                KeyboardButton(text=get_text("btn_my_folders", lang)),
+                KeyboardButton(text=get_text("btn_create_folder", lang)),
+            ],
+            [
+                KeyboardButton(text=get_text("btn_upload_content", lang)),
+                KeyboardButton(text=get_text("btn_summary_format", lang)),
+            ],
+            [
+                KeyboardButton(text=get_text("btn_lang", lang)),
+            ],
         ],
         resize_keyboard=True,
     )
 
 
+# Recognized button sets across languages for reliable filter matching
+ALL_MENU_TEXTS = set()
+for btn_k in (
+    "btn_my_folders",
+    "btn_create_folder",
+    "btn_upload_content",
+    "btn_summary_format",
+    "btn_lang",
+    "btn_language",
+):
+    ALL_MENU_TEXTS.update(get_button_variants(btn_k))
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    if not is_user_authorized(message.from_user.id):
-        await message.answer("⛔ Доступ ограничен корпоративной политикой безопасности.")
+    user_id = message.from_user.id
+    if not is_user_authorized(user_id):
+        lang, _ = await resolve_user_locale(user_id, message.from_user.language_code)
+        await message.answer(get_text("unauthorized", lang))
         return
 
+    saved_lang = await get_user_language(user_id)
+    onboarded = await is_user_onboarded(user_id)
+    if saved_lang is None and not onboarded:
+        await state.clear()
+        detected_lang = detect_locale(message.from_user.language_code)
+        kb = get_language_inline_kb(
+            active_lang=detected_lang,
+            is_auto=True,
+            prefix="lang_init",
+        )
+        await message.answer(
+            "🌐 Choose interface language / Оберіть мову інтерфейсу / Выберите язык интерфейса:",
+            reply_markup=kb,
+        )
+        return
+
+    lang, _ = await resolve_user_locale(user_id, message.from_user.language_code)
     await state.clear()
-    folder_id, fmt = await ensure_user_settings(message.from_user.id)
+    folder_id, fmt = await ensure_user_settings(user_id, lang=lang)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT name FROM folders WHERE id = ?", (folder_id,)) as cur:
             row = await cur.fetchone()
-    folder_name = row[0] if row else "📥 Быстрый входящий"
+    folder_name = row[0] if row else get_text("default_inbox_name", lang)
+    fmt_badge = get_format_badge(fmt, lang)
 
     await message.answer(
-        "🚀 AI Context Hub v2.3 Enterprise готов к работе!\n\n"
-        f"📂 Активная папка по умолчанию: «{folder_name}»\n"
-        f"📐 Текущий размер выжимки: {FORMAT_LABELS.get(fmt, '📋 Конспект')}\n\n"
-        "💡 Быстрый режим (Zero-Click): ты можешь просто кидать сюда файлы, ссылки, "
-        "голосовые или текст в любой момент без нажатия кнопок — они автоматически "
-        "обработаются и лягут в активную папку!",
-        reply_markup=main_menu_kb(),
+        get_text("start_greeting", lang, folder_name=folder_name, format_badge=fmt_badge),
+        reply_markup=main_menu_kb(lang),
     )
 
 
-@router.message(F.text == "📐 Формат выжимки")
+@router.callback_query(F.data.startswith("lang_init:"))
+async def cb_lang_init(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    if not is_user_authorized(user_id):
+        await callback.answer(get_text("unauthorized", "en"), show_alert=True)
+        return
+
+    choice = callback.data.split(":", 1)[1]
+    is_auto = (choice == "auto")
+    if is_auto:
+        persisted_lang = None
+        resolved_lang = detect_locale(callback.from_user.language_code)
+    else:
+        persisted_lang = choice if choice in ("en", "uk", "ru") else "en"
+        resolved_lang = persisted_lang
+
+    await state.clear()
+    await set_user_language(user_id, persisted_lang)
+
+    # Create initial default folder using localized title via get_text('default_inbox_name', resolved_lang)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, name FROM folders WHERE user_id = ? ORDER BY id ASC LIMIT 1",
+            (user_id,),
+        ) as cur:
+            existing = await cur.fetchone()
+
+        if existing:
+            folder_id, folder_name = existing[0], existing[1]
+        else:
+            inbox_name = get_text("default_inbox_name", resolved_lang)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M")
+            async with db.execute(
+                "INSERT INTO folders (user_id, name, created_at) VALUES (?, ?, ?)",
+                (user_id, inbox_name, now),
+            ) as cur:
+                folder_id = cur.lastrowid
+            await db.commit()
+            folder_name = inbox_name
+
+    await set_user_active_folder(user_id, folder_id)
+    _, fmt = await ensure_user_settings(user_id, lang=resolved_lang)
+    fmt_badge = get_format_badge(fmt, resolved_lang)
+
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    greeting = get_text(
+        "start_greeting",
+        resolved_lang,
+        folder_name=folder_name,
+        format_badge=fmt_badge,
+    )
+    await callback.message.answer(
+        greeting,
+        reply_markup=main_menu_kb(resolved_lang),
+    )
+    await callback.answer()
+
+
+@router.message(Command("lang"))
+@router.message(F.text.in_(get_button_variants("btn_lang")))
+async def cmd_language(message: Message):
+    user_id = message.from_user.id
+    if not is_user_authorized(user_id):
+        lang, _ = await resolve_user_locale(user_id, message.from_user.language_code)
+        await message.answer(get_text("unauthorized", lang))
+        return
+
+    active_lang, is_auto = await resolve_user_locale(user_id, message.from_user.language_code)
+    kb = get_language_inline_kb(
+        active_lang=active_lang,
+        is_auto=is_auto,
+        prefix="lang_set",
+    )
+    await message.answer(
+        "🌐 Choose interface language / Оберіть мову інтерфейсу / Выберите язык интерфейса:",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("lang_set:") | F.data.startswith("setlang:"))
+async def cb_set_language(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not is_user_authorized(user_id):
+        await callback.answer(get_text("unauthorized", "en"), show_alert=True)
+        return
+
+    choice = callback.data.split(":", 1)[1]
+    if choice == "auto":
+        await set_user_language(user_id, None)
+        active_lang = detect_locale(callback.from_user.language_code)
+        is_auto = True
+        confirmation = get_text("lang_switched_auto", active_lang)
+    elif choice in ("en", "uk", "ru"):
+        await set_user_language(user_id, choice)
+        active_lang = choice
+        is_auto = False
+        confirmation = get_text("lang_switched", choice)
+    else:
+        await callback.answer()
+        return
+
+    # In-place inline markup update with updated checkmark and auto-button text
+    new_kb = get_language_inline_kb(
+        active_lang=active_lang,
+        is_auto=is_auto,
+        prefix="lang_set",
+    )
+    try:
+        await callback.message.edit_reply_markup(reply_markup=new_kb)
+    except Exception:
+        pass
+
+    # Refresh persistent ReplyKeyboardMarkup
+    await callback.message.answer(
+        confirmation,
+        reply_markup=main_menu_kb(active_lang),
+    )
+    await callback.answer()
+
+
+@router.message(F.text.in_(get_button_variants("btn_summary_format")))
 async def menu_format_settings(message: Message):
     if not is_user_authorized(message.from_user.id):
         return
-    _, current_fmt = await ensure_user_settings(message.from_user.id)
+    lang = await resolve_user_lang(message.from_user.id, message.from_user.language_code)
+    _, current_fmt = await ensure_user_settings(message.from_user.id, lang=lang)
     buttons = []
-    for code, label in FORMAT_LABELS.items():
-        mark = "✅ " if code == current_fmt else ""
+    for code in ("SHORT", "MEDIUM", "LONG"):
+        label = get_format_badge(code, lang)
+        mark = "• " if code == current_fmt else ""
         buttons.append([InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"setfmt_{code}")])
 
     await message.answer(
-        "📐 Выбери размер выжимки по умолчанию для новых материалов:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        get_text("format_settings_prompt", lang),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
 
 @router.callback_query(F.data.startswith("setfmt_"))
 async def cb_set_default_format(callback: CallbackQuery):
+    lang = await resolve_user_lang(callback.from_user.id, callback.from_user.language_code)
     fmt = callback.data.replace("setfmt_", "")
-    if fmt in FORMAT_LABELS:
+    if fmt in ("SHORT", "MEDIUM", "LONG"):
         await set_user_default_format(callback.from_user.id, fmt)
+        badge = get_format_badge(fmt, lang)
         await callback.message.edit_text(
-            f"✅ Формат по умолчанию переключён на: {FORMAT_LABELS[fmt]}"
+            get_text("format_switched", lang, format_badge=badge)
         )
     await callback.answer()
 
 
-@router.message(F.text == "➕ Создать папку")
+@router.message(F.text.in_(get_button_variants("btn_create_folder")))
 async def start_new_folder(message: Message, state: FSMContext):
     if not is_user_authorized(message.from_user.id):
         return
+    lang = await resolve_user_lang(message.from_user.id, message.from_user.language_code)
     await state.set_state(HubStates.waiting_for_folder_name)
-    await message.answer("✏️ Введи название для новой папки (проекта):")
+    await message.answer(get_text("enter_folder_name", lang))
 
 
 @router.message(HubStates.waiting_for_folder_name)
 async def process_folder_name(message: Message, state: FSMContext):
+    lang = await resolve_user_lang(message.from_user.id, message.from_user.language_code)
     folder_name = (message.text or "").strip()
-    if not folder_name or folder_name in (
-        "📁 Мои папки", "➕ Создать папку", "📥 Загрузить материалы", "📐 Формат выжимки"
-    ):
-        await message.answer("⚠️ Введи корректное текстовое название папки.")
+    if not folder_name or folder_name in ALL_MENU_TEXTS:
+        await message.answer(get_text("invalid_folder_name", lang))
         return
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -765,18 +840,18 @@ async def process_folder_name(message: Message, state: FSMContext):
     await set_user_active_folder(message.from_user.id, new_folder_id)
     await state.clear()
     await message.answer(
-        f"✅ Папка «{folder_name}» создана и назначена активной по умолчанию!\n"
-        f"Можешь сразу закидывать в бота материалы.",
-        reply_markup=main_menu_kb(),
+        get_text("folder_created", lang, folder_name=folder_name),
+        reply_markup=main_menu_kb(lang),
     )
 
 
-@router.message(F.text == "📁 Мои папки")
+@router.message(F.text.in_(get_button_variants("btn_my_folders")))
 async def open_folders_list(message: Message, state: FSMContext):
     if not is_user_authorized(message.from_user.id):
         return
+    lang = await resolve_user_lang(message.from_user.id, message.from_user.language_code)
     await state.clear()
-    active_id, _ = await ensure_user_settings(message.from_user.id)
+    active_id, _ = await ensure_user_settings(message.from_user.id, lang=lang)
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -786,22 +861,23 @@ async def open_folders_list(message: Message, state: FSMContext):
             folders = await cursor.fetchall()
 
     if not folders:
-        await message.answer("У тебя пока нет папок. Нажми «➕ Создать папку».")
+        await message.answer(get_text("no_folders", lang))
         return
 
     buttons = []
     for f_id, f_name in folders:
-        pin = "📌 " if f_id == active_id else "📁 "
+        pin = "[Active] " if f_id == active_id else ""
         buttons.append([InlineKeyboardButton(text=f"{pin}{f_name}", callback_data=f"folder_view_{f_id}")])
 
     await message.answer(
-        "📂 Твои папки (📌 отмечена активная папка для быстрой загрузки):",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        get_text("folders_list_title", lang),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
 
 @router.callback_query(F.data.startswith("folder_view_"))
 async def view_folder_details(callback: CallbackQuery):
+    lang = await resolve_user_lang(callback.from_user.id, callback.from_user.language_code)
     folder_id = int(callback.data.split("_")[-1])
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -812,7 +888,7 @@ async def view_folder_details(callback: CallbackQuery):
             folder = await cursor.fetchone()
 
         if not folder:
-            await callback.answer("Папка не найдена.", show_alert=True)
+            await callback.answer(get_text("folder_not_found", lang), show_alert=True)
             return
 
         async with db.execute(
@@ -822,32 +898,41 @@ async def view_folder_details(callback: CallbackQuery):
 
     await set_user_active_folder(callback.from_user.id, folder_id)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📥 Загрузить сюда материалы", callback_data=f"upload_to_{folder_id}")],
-        [InlineKeyboardButton(text="📄 Скачать весь архив (.txt)", callback_data=f"export_txt_{folder_id}")],
-        [InlineKeyboardButton(text="🗑 Удалить папку", callback_data=f"delete_folder_{folder_id}")],
-    ])
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=get_text("btn_upload_to_folder", lang), callback_data=f"upload_to_{folder_id}")],
+            [InlineKeyboardButton(text=get_text("btn_export_folder", lang), callback_data=f"export_txt_{folder_id}")],
+            [InlineKeyboardButton(text=get_text("btn_delete_folder", lang), callback_data=f"delete_folder_{folder_id}")],
+        ]
+    )
 
     await callback.message.edit_text(
-        f"📁 Папка: {folder[0]} (назначена активной 📌)\n"
-        f"📅 Создана: {folder[1]}\n"
-        f"📊 Сохранено выжимок: {count}",
+        get_text(
+            "folder_details",
+            lang,
+            folder_name=folder[0],
+            created_at=folder[1],
+            count=count,
+        ),
         reply_markup=kb,
     )
-    await callback.answer("Папка назначена активной!")
+    await callback.answer(get_text("folder_set_active", lang))
 
 
 @router.callback_query(F.data.startswith("delete_folder_"))
 async def confirm_delete_folder(callback: CallbackQuery):
+    lang = await resolve_user_lang(callback.from_user.id, callback.from_user.language_code)
     folder_id = int(callback.data.split("_")[-1])
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="❗️ Да, удалить навсегда", callback_data=f"confirm_del_{folder_id}"),
-            InlineKeyboardButton(text="🔙 Отмена", callback_data=f"folder_view_{folder_id}"),
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=get_text("btn_confirm_delete", lang), callback_data=f"confirm_del_{folder_id}"),
+                InlineKeyboardButton(text=get_text("btn_cancel", lang), callback_data=f"folder_view_{folder_id}"),
+            ]
         ]
-    ])
+    )
     await callback.message.edit_text(
-        "⚠️ Точно удалить эту папку и все сохранённые в ней выжимки?",
+        get_text("confirm_delete_title", lang),
         reply_markup=kb,
     )
     await callback.answer()
@@ -855,6 +940,7 @@ async def confirm_delete_folder(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("confirm_del_"))
 async def execute_delete_folder(callback: CallbackQuery):
+    lang = await resolve_user_lang(callback.from_user.id, callback.from_user.language_code)
     folder_id = int(callback.data.split("_")[-1])
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM summaries WHERE folder_id = ?", (folder_id,))
@@ -864,13 +950,14 @@ async def execute_delete_folder(callback: CallbackQuery):
         )
         await db.commit()
 
-    await ensure_user_settings(callback.from_user.id)
-    await callback.message.edit_text("🗑 Папка и все её материалы удалены.")
+    await ensure_user_settings(callback.from_user.id, lang=lang)
+    await callback.message.edit_text(get_text("folder_deleted", lang))
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("export_txt_"))
 async def download_folder_archive(callback: CallbackQuery):
+    lang = await resolve_user_lang(callback.from_user.id, callback.from_user.language_code)
     folder_id = int(callback.data.split("_")[-1])
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -881,7 +968,7 @@ async def download_folder_archive(callback: CallbackQuery):
             folder = await cursor.fetchone()
 
         if not folder:
-            await callback.answer("Папка не найдена.", show_alert=True)
+            await callback.answer(get_text("folder_not_found", lang), show_alert=True)
             return
 
         async with db.execute(
@@ -892,22 +979,24 @@ async def download_folder_archive(callback: CallbackQuery):
             items = await cursor.fetchall()
 
     if not items:
-        await callback.answer("В этой папке пока нет выжимок!", show_alert=True)
+        await callback.answer(get_text("folder_archive_empty", lang), show_alert=True)
         return
 
     folder_name = folder[0]
     lines = [
-        f"==================================================",
-        f"АРХИВ ПРОЕКТА: {folder_name}",
-        f"Экспортировано: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"Всего материалов: {len(items)}",
-        f"==================================================\n",
+        "==================================================",
+        get_text("archive_header_project", lang, folder_name=folder_name),
+        get_text("archive_header_exported", lang, date=datetime.now().strftime("%Y-%m-%d %H:%M")),
+        get_text("archive_header_total", lang, count=len(items)),
+        "==================================================\n",
     ]
 
     for idx, (s_type, s_title, s_text, s_fmt, s_date) in enumerate(items, 1):
-        fmt_label = FORMAT_LABELS.get(s_fmt, "📋 Конспект")
-        lines.append(f"--- МАТЕРИАЛ #{idx} [{s_type.upper()} | {fmt_label}] ({s_date}) ---")
-        lines.append(f"ИСТОЧНИК: {s_title}\n")
+        fmt_label = get_format_badge(s_fmt, lang)
+        lines.append(
+            get_text("archive_item_header", lang, idx=idx, type=s_type.upper(), format_badge=fmt_label, date=s_date)
+        )
+        lines.append(get_text("archive_source_label", lang, source=s_title) + "\n")
         lines.append(s_text)
         lines.append("\n" + "=" * 50 + "\n")
 
@@ -921,7 +1010,7 @@ async def download_folder_archive(callback: CallbackQuery):
         doc_file = FSInputFile(export_path, filename=f"{safe_name}_context.txt")
         await callback.message.answer_document(
             doc_file,
-            caption=f"📦 Полный архив выжимок папки «{folder_name}» ({len(items)} шт.)",
+            caption=get_text("archive_caption", lang, folder_name=folder_name, count=len(items)),
         )
     finally:
         if os.path.exists(export_path):
@@ -930,10 +1019,11 @@ async def download_folder_archive(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.message(F.text == "📥 Загрузить материалы")
+@router.message(F.text.in_(get_button_variants("btn_upload_content")))
 async def start_upload_flow(message: Message):
     if not is_user_authorized(message.from_user.id):
         return
+    lang = await resolve_user_lang(message.from_user.id, message.from_user.language_code)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT id, name FROM folders WHERE user_id = ? ORDER BY id DESC",
@@ -942,45 +1032,41 @@ async def start_upload_flow(message: Message):
             folders = await cursor.fetchall()
 
     if not folders:
-        await message.answer("Сначала создай хотя бы одну папку через «➕ Создать папку».")
+        await message.answer(get_text("need_create_folder_first", lang))
         return
 
     buttons = [
-        [InlineKeyboardButton(text=f"📁 {f_name}", callback_data=f"upload_to_{f_id}")]
+        [InlineKeyboardButton(text=f_name, callback_data=f"upload_to_{f_id}")]
         for f_id, f_name in folders
     ]
     await message.answer(
-        "Выбери активную папку для приёма материалов:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        get_text("select_upload_folder", lang),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
 
 
 @router.callback_query(F.data.startswith("upload_to_"))
 async def select_folder_for_upload(callback: CallbackQuery, state: FSMContext):
+    lang = await resolve_user_lang(callback.from_user.id, callback.from_user.language_code)
     folder_id = int(callback.data.split("_")[-1])
     await set_user_active_folder(callback.from_user.id, folder_id)
     await state.set_state(HubStates.waiting_for_input)
     await state.update_data(active_folder_id=folder_id)
 
-    await callback.message.edit_text(
-        "📥 Папка активирована!\n\n"
-        "Закидывай материалы в любом количестве:\n"
-        "• Текстовые сообщения и заметки\n"
-        "• Ссылки на статьи (3-уровневый обход блокировок)\n"
-        "• Документы (.pdf, .docx, .txt, .py, .md, .log, .json)\n"
-        "• Голосовые сообщения и аудиофайлы"
-    )
+    await callback.message.edit_text(get_text("upload_folder_activated", lang))
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("rev_ok_"))
 async def review_ok_handler(callback: CallbackQuery):
+    lang = await resolve_user_lang(callback.from_user.id, callback.from_user.language_code)
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Отлично! Оставляем в базе 👍")
+    await callback.answer(get_text("review_keep_alert", lang))
 
 
 @router.callback_query(F.data.startswith("rev_del_"))
 async def review_delete_handler(callback: CallbackQuery):
+    lang = await resolve_user_lang(callback.from_user.id, callback.from_user.language_code)
     summary_id = int(callback.data.split("_")[-1])
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM summaries WHERE id = ?", (summary_id,))
@@ -989,13 +1075,14 @@ async def review_delete_handler(callback: CallbackQuery):
     try:
         await callback.message.delete()
     except Exception:
-        await callback.message.edit_text("🗑 Выжимка удалена из базы данных.")
-    await callback.answer("Удалено из базы!")
+        await callback.message.edit_text(get_text("review_del_msg", lang))
+    await callback.answer(get_text("review_del_alert", lang))
 
 
 @router.callback_query(F.data.startswith("rev_regen_") | F.data.startswith("rev_fmt_"))
 async def review_regenerate_or_change_format(callback: CallbackQuery):
     """Re-synthesize summary in a new format or variation using cached source text."""
+    lang = await resolve_user_lang(callback.from_user.id, callback.from_user.language_code)
     data = callback.data
     if data.startswith("rev_regen_"):
         summary_id = int(data.replace("rev_regen_", ""))
@@ -1010,12 +1097,12 @@ async def review_regenerate_or_change_format(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT source_title, summary_text, raw_text, format_size FROM summaries WHERE id = ?",
-            (summary_id,)
+            (summary_id,),
         ) as cur:
             row = await cur.fetchone()
 
     if not row:
-        await callback.answer("⚠️ Запись не найдена в базе.", show_alert=True)
+        await callback.answer(get_text("review_not_found", lang), show_alert=True)
         return
 
     source_title, current_summary, raw_text, current_fmt = row
@@ -1027,19 +1114,18 @@ async def review_regenerate_or_change_format(callback: CallbackQuery):
     if not raw_text:
         if size_rank.get(new_fmt, 2) > size_rank.get(current_fmt, 2):
             await callback.answer(
-                "⚠️ Исходник этого документа уже выгружен из буфера (хранятся последние 10). "
-                "Из меньшего формата нельзя развернуть больший, но можно переделать текущий или сжать!",
-                show_alert=True
+                get_text("review_pruned_warning", lang),
+                show_alert=True,
             )
             return
         base_material = current_summary
     else:
         base_material = raw_text
 
-    fmt_badge = FORMAT_LABELS.get(new_fmt, "📋 Конспект")
-    await callback.answer(f"Перестраиваю в формат: {fmt_badge}...")
+    fmt_badge = get_format_badge(new_fmt, lang)
+    await callback.answer(get_text("review_rebuilding_alert", lang, format_badge=fmt_badge))
     await callback.message.edit_text(
-        f"🔄 Перестраиваю выжимку для «{source_title}» -> [{fmt_badge}]..."
+        get_text("review_rebuilding_msg", lang, source_title=source_title, format_badge=fmt_badge)
     )
 
     try:
@@ -1048,48 +1134,51 @@ async def review_regenerate_or_change_format(callback: CallbackQuery):
             source_title=source_title,
             format_size=new_fmt,
             retry_variation=is_variation,
+            target_lang=lang,
         )
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
                 "UPDATE summaries SET summary_text = ?, format_size = ? WHERE id = ?",
-                (new_summary, new_fmt, summary_id)
+                (new_summary, new_fmt, summary_id),
             )
             await db.commit()
 
-        header = f"♻️ Обновлённая выжимка [{fmt_badge}]\n📌 Источник: {source_title}"
+        header = get_text("header_summary_updated", lang, format_badge=fmt_badge, source_title=source_title)
         full_msg = f"{header}\n\n{new_summary}"
         await callback.message.edit_text(
             full_msg[:3900],
-            reply_markup=review_inline_kb(summary_id, new_fmt)
+            reply_markup=review_inline_kb(summary_id, new_fmt, lang),
         )
     except Exception as e:
-        logger.error(f"Ошибка при переделке записи #{summary_id}: {e}")
-        await callback.message.edit_text("❌ Ошибка при перестройке текста. Попробуйте позже.")
+        logger.error(f"Error regenerating record #{summary_id}: {e}")
+        await callback.message.edit_text(get_text("review_rebuild_error", lang))
 
 
 @router.message()
 async def enqueue_incoming_material(message: Message, state: FSMContext, bot: Bot):
     """Zero-click universal handler for documents, voice/audio, URLs, and raw notes."""
     user_id = message.from_user.id
+    lang, _ = await resolve_user_locale(user_id, message.from_user.language_code)
     if not is_user_authorized(user_id):
-        await message.answer("⛔ Доступ запрещён.")
+        await message.answer(get_text("unauthorized", lang))
         return
 
     data = await state.get_data()
-    default_folder_id, default_format = await ensure_user_settings(user_id)
+    default_folder_id, default_format = await ensure_user_settings(user_id, lang=lang)
     folder_id = data.get("active_folder_id") or default_folder_id
 
     if user_id not in USER_QUEUES:
         USER_QUEUES[user_id] = []
 
     new_tasks = []
+    telegram_lang = message.from_user.language_code
 
     if message.document:
         doc = message.document
         if doc.file_size and doc.file_size > MAX_FILE_SIZE_BYTES:
             await message.answer(
-                f"⚠️ Файл «{doc.file_name}» превышает безопасный лимит ({MAX_FILE_SIZE_MB} МБ)."
+                get_text("file_limit_exceeded", lang, file_name=doc.file_name or "file", max_mb=MAX_FILE_SIZE_MB)
             )
             return
 
@@ -1098,7 +1187,7 @@ async def enqueue_incoming_material(message: Message, state: FSMContext, bot: Bo
         supported_txt = (".txt", ".md", ".py", ".csv", ".log", ".json", ".ini", ".cfg", ".gsc")
 
         if ext not in (".pdf", ".docx") + supported_txt:
-            await message.answer(f"⚠️ Формат {ext} пока не поддерживается.")
+            await message.answer(get_text("unsupported_format", lang, ext=ext))
             return
 
         local_path = os.path.join(TEMP_DIR, f"{user_id}_{doc.file_unique_id}_{file_name}")
@@ -1111,24 +1200,27 @@ async def enqueue_incoming_material(message: Message, state: FSMContext, bot: Bo
             "chat_id": message.chat.id,
             "folder_id": folder_id,
             "source_type": s_type,
-            "source_title": f"Файл {file_name}",
+            "source_title": get_text("title_file", lang, file_name=file_name),
             "file_path": local_path,
             "format_size": default_format,
+            "lang": lang,
+            "telegram_lang": telegram_lang,
         })
 
     elif message.voice or message.audio:
         media = message.voice or message.audio
         if media.file_size and media.file_size > MAX_FILE_SIZE_BYTES:
-            await message.answer(f"⚠️ Аудиофайл превышает лимит {MAX_FILE_SIZE_MB} МБ.")
+            await message.answer(get_text("audio_limit_exceeded", lang, max_mb=MAX_FILE_SIZE_MB))
             return
 
         ext = ".ogg" if message.voice else ".mp3"
         mime = media.mime_type or ("audio/ogg" if message.voice else "audio/mpeg")
-        title = (
-            f"Голосовое ({media.duration} сек)"
-            if message.voice
-            else f"Аудио ({ sanitize_filename(getattr(media, 'file_name', None) or 'audio.mp3') })"
-        )
+        if message.voice:
+            title = get_text("title_voice", lang, duration=media.duration)
+        else:
+            audio_name = sanitize_filename(getattr(media, "file_name", None) or "audio.mp3")
+            title = get_text("title_audio", lang, file_name=audio_name)
+
         local_path = os.path.join(TEMP_DIR, f"{user_id}_{media.file_unique_id}{ext}")
         await bot.download(media, destination=local_path)
 
@@ -1141,6 +1233,8 @@ async def enqueue_incoming_material(message: Message, state: FSMContext, bot: Bo
             "file_path": local_path,
             "mime_type": mime,
             "format_size": default_format,
+            "lang": lang,
+            "telegram_lang": telegram_lang,
         })
 
     elif message.text or message.caption:
@@ -1157,6 +1251,8 @@ async def enqueue_incoming_material(message: Message, state: FSMContext, bot: Bo
                     "source_title": url,
                     "url": url,
                     "format_size": default_format,
+                    "lang": lang,
+                    "telegram_lang": telegram_lang,
                 })
         elif len(text) >= 5:
             short_title = text[:40].replace("\n", " ") + ("..." if len(text) > 40 else "")
@@ -1165,9 +1261,11 @@ async def enqueue_incoming_material(message: Message, state: FSMContext, bot: Bo
                 "chat_id": message.chat.id,
                 "folder_id": folder_id,
                 "source_type": "text",
-                "source_title": f"Заметка: {short_title}",
+                "source_title": get_text("title_note", lang, short_title=short_title),
                 "raw_text": text,
                 "format_size": default_format,
+                "lang": lang,
+                "telegram_lang": telegram_lang,
             })
 
     if not new_tasks:
@@ -1183,7 +1281,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("🚀 Бот AI Context Hub v2.3 Enterprise успешно запущен!")
+    logger.info("AI Context Hub Enterprise engine running.")
     # Flush backlog of stale Telegram updates immediately before polling
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
@@ -1193,4 +1291,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот штатно остановлен.")
+        logger.info("Bot process terminated gracefully.")

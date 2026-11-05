@@ -358,6 +358,7 @@ async def parse_and_summarize_url(
     temperature: float = 0.25,
     use_search_grounding: bool = False,
     router: Optional[LLMRouter] = None,
+    target_lang: str = "en",
     **kwargs: Any,
 ) -> LinkSummaryResponse:
     """Analyze and summarize web content from a URL via local text extraction and LLM cascade.
@@ -365,7 +366,7 @@ async def parse_and_summarize_url(
     1. Restores asynchronous local webpage fetching via aiohttp with browser User-Agent.
     2. Strips HTML tags, scripts, and styles via BeautifulSoup, truncating safely at 20,000 chars.
     3. Passes extracted plain text to the unified LLM router and Executive Summary pipeline
-       without Google Search Grounding tools or raw URL passing.
+       in the specified target interface language without Google Search Grounding tools or raw URL passing.
 
     Args:
         url: Target web URL to fetch and summarize.
@@ -376,6 +377,7 @@ async def parse_and_summarize_url(
         temperature: Sampling temperature for generation.
         use_search_grounding: Disabled; kept only for backward signature compatibility.
         router: Optional custom LLMRouter instance for key rotation.
+        target_lang: Target interface language code ('en', 'uk', 'ru').
         **kwargs: Unused backward-compatibility kwargs.
 
     Returns:
@@ -391,7 +393,7 @@ async def parse_and_summarize_url(
     # 1 & 2: Local asynchronous webpage fetching and HTML stripping
     title, clean_text = await fetch_webpage_content(clean_url)
 
-    # 3: Pass extracted clean text to the unified LLM router
+    # 3: Pass extracted clean text to the unified LLM router with target_lang
     active_router = router or default_router
     active_model = model or DEFAULT_GEMINI_MODEL
 
@@ -399,6 +401,7 @@ async def parse_and_summarize_url(
         raw_text=clean_text,
         source_title=title,
         format_size=format_size,
+        target_lang=target_lang,
         router=active_router,
     )
 

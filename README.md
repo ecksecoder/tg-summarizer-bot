@@ -1,244 +1,198 @@
-# 🤖 AI Context Hub — Telegram AI Summarizer
+# AI Context Hub
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Python-3.10%2B-blue?logo=python" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/aiogram-3.x-blue?logo=telegram" alt="aiogram 3.x">
-  <img src="https://img.shields.io/badge/Google%20Gemini%20API-SDK%20v2-orange?logo=google" alt="Google Gemini API">
-  <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT License">
-</p>
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+[![aiogram 3.x](https://img.shields.io/badge/aiogram-3.x-blue)](https://github.com/aiogram/aiogram)
+[![SQLite WAL](https://img.shields.io/badge/SQLite-WAL-lightgrey)](https://www.sqlite.org/)
+[![Google GenAI SDK](https://img.shields.io/badge/Google%20GenAI-SDK-orange)](https://github.com/google-gemini/google-genai)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-<p align="center">
-  <a href="#-ai-context-hub--умный-ai-суммаризатор-текста-pdf-и-документов">🇷🇺 Русский</a> &nbsp;|&nbsp;
-  <a href="#-ai-context-hub--smart-ai-summarizer-for-text-pdf-and-documents">🇬🇧 English</a>
-</p>
+[English] | [Документація українською](README_UA.md) | [Документация на русском](README_RU.md)
 
 ---
 
-## 🇷🇺 AI Context Hub — Умный AI-суммаризатор текста, PDF и документов
+## Architectural Overview
 
-**AI Context Hub** — современный асинхронный Telegram-бот на базе искусственного интеллекта для автоматического анализа, извлечения сути и интеллектуальной суммаризации любого входящего контента: заметок, веб-статей, книг и документов (.pdf, .docx, .txt), а также голосовых сообщений и аудиозаписей.
+```
++--------------------+
+|  Telegram Client   |
++---------+----------+
+          |
+          v
++-------------------------------+
+|   aiogram 3.x Router / FSM    |
++---------------+---------------+
+                |
+                v
++-------------------------------+
+|     Priority Task Queue       |
++---------------+---------------+
+                |
+                v
++-----------------------------------------------------------------------------------------------+
+|                                    Local Extraction Layer                                     |
+|  - Documents and Plaintext: Local extractors (.pdf, .docx, .txt, .md, .py, .csv, .log,        |
+|    .json, .ini, .cfg, .gsc via pypdf and python-docx)                                         |
+|  - Audio and Voice: Google GenAI File API (.mp3, .ogg with ephemeral lifecycle)               |
+|  - Web Articles: aiohttp + BeautifulSoup DOM cleaning (anti-SSRF validation, 20,000 char max) |
++-----------------------------------------------+-----------------------------------------------+
+                                                |
+                                                v
++-----------------------------------------------------------------------------------------------+
+|                                          LLM Router                                           |
+|  - Gemini Flash Cascade: Thread-safe round-robin API key rotation and model fallback         |
+|  - Failover Gateway: Groq API (llama-3.3-70b-versatile) on HTTP 429/503 quota exhaustion     |
+|  - Cross-Lingual Intelligence: Automatic end-to-end translation into user UI language         |
+|  - Emergency Extraction: Deterministic paragraph extraction on total upstream outage          |
++-----------------------------------------------+-----------------------------------------------+
+                                                |
+                                                v
++-----------------------------------------------------------------------------------------------+
+|                                      SQLite WAL Storage                                       |
+|  - Automated idempotent schema migrations (language in user_settings, format_size/raw_text)   |
+|  - Sliding-window raw text pruning (configurable SLIDING_WINDOW_RAW_LIMIT)                    |
+|  - Project folder grouping and consolidated TXT archive export                                |
++-----------------------------------------------+-----------------------------------------------+
+```
 
 ---
 
-### 📑 Поддерживаемые форматы выжимки
+## Core Features
 
-Бот формирует структурированные материалы под любую задачу с возможностью переключения «на лету» прямо под сообщением:
+### Cross-Lingual Intelligence (Universal Translation & Summarization)
+AI Context Hub acts as a universal cross-lingual synthesis engine. Any incoming material—whether web articles and links, PDF documents, DOCX files, plaintext source code, or spoken voice recordings—arriving in any foreign language (e.g. French, German, Spanish, Chinese, Japanese, etc.) is automatically analyzed, fully translated, and summarized directly into the user's active interface language (English, Ukrainian, or Russian). All structured headings, bullet points, executive takeaways, and action items are natively adapted into the destination language while preserving factual accuracy, technical metrics, and proper nouns.
 
-1. ⚡ **Шпаргалка / Заметка (`SHORT`)**
-   - Ультракомпактная выжимка: строго 5–10 ключевых тезисов, цифр и выводов на один экран смартфона.
-   - Максимум фактов без «воды» — идеально для быстрого сканирования сути.
-2. 📋 **Конспект (`MEDIUM`)**
-   - Сбалансированный структурированный конспект, разделенный на логические блоки с заголовками.
-   - Сохраняет важные параметры, термины, сюжетные линии и причинно-следственные связи.
-3. 📚 **Глубокий пересказ (`LONG`)**
-   - Подробный хронологический разбор каждой главы или раздела с сохранением примеров, цитат и нюансов.
-   - Полностью заменяет чтение объемного оригинала.
+### Multi-Source Ingestion Pipeline
+- Document and Code Extraction: Local asynchronous extraction for binary documents (PDF via `pypdf`, DOCX via `python-docx`) and structured plaintext files (`.txt`, `.md`, `.py`, `.csv`, `.log`, `.json`, `.ini`, `.cfg`, `.gsc`) up to 20 MB without external cloud parsing dependencies.
+- Audio and Voice Processing: Ephemeral audio ingestion (`.mp3`, `.ogg`, and Telegram voice notes) via the Google GenAI File API, generating structured executive summaries followed by immediate remote file deletion.
+- Web Content Parsing (`parser.py`): Local asynchronous web page fetching using `aiohttp` with standard browser User-Agent headers, anti-SSRF verification (blocking private, link-local, loopback, and reserved IP ranges), DOM cleaning (`script`, `style`, `nav`, `header`, `footer`) via `BeautifulSoup`, and safe text truncation at 20,000 characters to protect model context quotas.
 
-> 💡 **Интерактивное управление**: под каждой готовой выжимкой доступны inline-кнопки для мгновенной смены формата (`⚡ Шпаргалка` ↔ `📋 Конспект` ↔ `📚 Пересказ`), кнопка «🔄 Переделать» (генерация альтернативного варианта) и «❌ Удалить».
+### Multi-Tier Summaries
+Materials are synthesized into one of three distinct compression tiers, configured by default or toggled interactively via inline review buttons:
+- SHORT (Cheat Sheet): High-density distillation of 5 to 7 key facts, numbers, and parameters fitted for single-screen review.
+- MEDIUM (Structured Summary): Balanced brief containing 8 to 12 logically grouped points preserving context, arguments, and action items.
+- LONG (In-Depth Retelling): Comprehensive section-by-section breakdown detailing methodology, technical nuances, and background context.
 
----
+### Background Queue Worker & Locale Isolation
+All user submissions are scheduled in an in-memory priority FIFO queue:
+- Priority 1: Raw text notes and plaintext files.
+- Priority 2: Structured documents (PDF, DOCX).
+- Priority 3: Web links.
+- Priority 4: Audio recordings and voice notes.
 
-### 🌟 Ключевые возможности
+The queue worker processes items sequentially per user to prevent RPM/TPM rate limit spikes. Before processing each task, the worker resolves the user's active language from the database, guaranteeing absolute locale isolation across background operations.
 
-* **Zero-Click Ingestion (Приём в один клик):** Отправляйте текст, файлы, аудио или ссылки прямо в чат без блуждания по меню. Бот автоматически определит тип контента, поставит в очередь с учетом приоритетов и сохранит в активную папку.
-* **Поддержка документов и книг:** Обработка файлов `.pdf`, `.docx`, `.txt`, `.md`, `.py`, `.json`, `.csv`, `.log` объемом до 20 МБ.
-* **Голосовые и аудиоматериалы:** Распознавание и суммаризация голосовых сообщений и файлов `.mp3` / `.ogg` через Google Gemini File API.
-* **5-эшелонный парсинг веб-страниц:** Извлечение чистых статей (Jina Reader API, прямое подключение Chrome TLS, Markdown.new, CORS-прокси) со встроенной защитой от SSRF-атак (`Anti-SSRF`).
-* **Отказоустойчивый роутер AI:** Автоматическое обнаружение доступных моделей Google Gemini (`google-genai` SDK), резервная маршрутизация к Groq API при пиковых нагрузках (429/503) и автономный локальный анализатор.
-* **Проекты и папки:** Организация материалов по тематическим папкам с возможностью экспорта всех выжимок проекта в единый файл `.txt`.
-* **База данных SQLite (WAL):** Высокоскоростное асинхронное хранение с автоматическими миграциями и скользящим буфером сырых данных (`N=10`) для экономии места на диске.
+### Trilingual Interface with Auto-Detection & Runtime Override
+- Onboarding Gate: First-time users without a configured language in SQLite are presented with a trilingual onboarding interface upon `/start` offering British English (`en`), Ukrainian (`uk`), Russian (`ru`), and dynamic Telegram client matching (`auto`).
+- Dynamic Auto Resolution: The Auto option dynamically detects the Telegram client language while persisting NULL in the database, allowing cross-device locale responsiveness.
+- Runtime Override: Users can switch languages at any time via `/lang` or the persistent menu button (`btn_lang`), updating SQLite settings, inline button markers, and the persistent ReplyKeyboardMarkup in-place.
+- Resilient Routing: aiogram handlers use `get_button_variants` to match incoming messages across all supported language permutations.
 
----
-
-### 🛠 Стек технологий
-
-* **Язык программирования:** Python 3.10+ (`asyncio`)
-* **Telegram-фреймворк:** [aiogram 3.x](https://github.com/aiogram/aiogram) (FSM, Routers, Inline Callbacks, MemoryStorage)
-* **Нейросетевой стек:** [Google GenAI SDK](https://github.com/google-gemini/google-genai) (Gemini Flash), резервный шлюз Groq API
-* **База данных:** SQLite 3 в режиме Write-Ahead Logging (`PRAGMA journal_mode=WAL`)
-* **Парсинг и обработка данных:** `aiohttp`, `beautifulsoup4`, `pypdf`, `python-docx`
-* **Конфигурация:** `python-dotenv`
+### Automated SQLite Schema Migrations
+- WAL Mode Concurrency: Multi-threaded SQLite database operations executed via an asynchronous wrapper with WAL journal mode and busy timeouts.
+- Idempotent Column Additions: Automatic startup detection and migration for missing columns (`language` in `user_settings`, `raw_text` and `format_size` in `summaries`).
+- Sliding-Window Storage Hygiene: Automated pruning enforced by `SLIDING_WINDOW_RAW_LIMIT`, clearing uncompressed raw text payloads for older records while retaining the generated executive summaries.
 
 ---
 
-### 🚀 Пошаговая инструкция по установке и запуску
+## Tech Stack
 
-#### 1. Клонирование репозитория
+| Component | Technology | Purpose |
+|---|---|---|
+| Runtime Environment | Python 3.10+ | Asynchronous execution runtime |
+| Framework | aiogram 3.x | Telegram Bot API router, FSM context, inline and reply keyboards |
+| Primary Inference | Google GenAI SDK | Multi-key round-robin rotation across Gemini Flash models |
+| Failover Inference | Groq Cloud SDK / REST | Automatic fallback to llama-3.3-70b-versatile upon quota exhaustion |
+| Database Engine | SQLite 3 (WAL mode) | Concurrency-optimized persistent storage with foreign keys |
+| Web Scraping | aiohttp + BeautifulSoup4 | Asynchronous HTTP fetching, anti-SSRF validation, DOM cleaning |
+| Document Parsing | pypdf, python-docx | Text extraction from PDF and DOCX binary files |
+| Configuration | python-dotenv | Environment variable parsing and type casting |
+
+---
+
+## Setup and Environment Configuration
+
+### 1. Clone the Repository
 ```bash
 git clone https://github.com/your-username/ai-context-hub.git
 cd ai-context-hub
 ```
 
-#### 2. Создание и активация виртуального окружения
+### 2. Configure Virtual Environment
 
-* **Windows:**
-  ```powershell
-  python -m venv venv
-  venv\Scripts\activate
-  ```
-* **Linux / macOS:**
-  ```bash
-  python3 -m venv venv
-  source venv/bin/activate
-  ```
+On Linux / macOS:
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
 
-#### 3. Установка зависимостей
+On Windows (PowerShell):
+```powershell
+python -m venv venv
+venv\Scripts\Activate.ps1
+```
+
+### 3. Install Dependencies
 ```bash
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-#### 4. Настройка переменных окружения
-Создайте файл `.env` на основе шаблона:
-* **Windows:**
-  ```cmd
-  copy .env.example .env
-  ```
-* **Linux / macOS:**
-  ```bash
-  cp .env.example .env
-  ```
-
-Откройте файл `.env` и вставьте ваши ключи:
-```ini
-# Токен бота от @BotFather в Telegram
-BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxYZ
-
-# Ключ Google Gemini (бесплатно в https://aistudio.google.com/)
-GEMINI_API_KEY=AIzaSy...
-
-# (Опционально) Резервный ключ Groq (https://console.groq.com/)
-GROQ_API_KEY=gsk_...
-
-# (Опционально) Telegram ID администраторов через запятую (оставьте пустым для общего доступа)
-ALLOWED_USER_IDS=
-```
-
-#### 5. Запуск бота
-* Напрямую через Python:
-  ```bash
-  python bot.py
-  ```
-* На Windows через готовый батник:
-  ```cmd
-  run_bot.bat
-  ```
-
----
-
-<br>
-
-## 🇬🇧 AI Context Hub — Smart AI Summarizer for Text, PDF, and Documents
-
-**AI Context Hub** is an asynchronous Telegram assistant powered by artificial intelligence. It automatically ingests, extracts, and summarizes raw notes, web articles, documents (`.pdf`, `.docx`, `.txt`), and voice/audio files into structured summaries.
-
----
-
-### 📑 Supported Summary Formats
-
-The bot provides three distinct compression levels, switchable on-the-fly via inline buttons:
-
-1. ⚡ **Cheat Sheet / Quick Note (`SHORT`)**
-   - High-density distillation: strictly 5–10 key takeaways, metrics, and bullet points.
-   - Designed for instant reading on a single phone screen with zero filler.
-2. 📋 **Structured Notes (`MEDIUM`)**
-   - Well-balanced notes categorized into logical sections with descriptive headings.
-   - Retains essential parameters, key terminology, arguments, and cause-and-effect relationships.
-3. 📚 **In-Depth Retelling (`LONG`)**
-   - Comprehensive chronological breakdown of every chapter or section.
-   - Preserves examples, context, and nuances, completely eliminating the need to read the full source text.
-
-> 💡 **Inline Controls**: Every generated summary includes buttons to re-synthesize into another format (`⚡ Cheat Sheet` ↔ `📋 Structured Notes` ↔ `📚 Deep Retelling`), request an alternative perspective (`🔄 Regenerate`), or delete the entry (`❌ Delete`).
-
----
-
-### 🌟 Key Features
-
-* **Zero-Click Ingestion Pipeline:** Drop raw notes, documents, voice notes, or links directly into chat—tasks are automatically prioritized, queued, and mapped to your active project folder.
-* **Multi-Format Document Support:** Processes `.pdf`, `.docx`, `.txt`, `.md`, `.py`, `.json`, `.csv`, `.log` files up to 20 MB.
-* **Audio & Voice Transcription:** Ingests voice messages and `.mp3` / `.ogg` files via the Google Gemini File API.
-* **5-Tier Web Article Extractor:** Robust multi-tier scraper (Jina Reader API, direct Chrome TLS, Markdown.new, CORS fallback) equipped with anti-SSRF IP validation.
-* **Resilient Multi-Model Routing:** Dynamic model discovery with the `google-genai` SDK, automatic failover to Groq API endpoints on rate limits (429/503), and local extractive fallback.
-* **Project Folders & Archives:** Organize items into custom project folders and export the entire collection as a single `.txt` archive.
-* **SQLite WAL Storage:** Thread-pooled database running in `WAL` (Write-Ahead Logging) mode with auto-migrations and sliding-window cleanup (`N=10`) to keep storage lightweight.
-
----
-
-### 🛠 Tech Stack
-
-* **Language:** Python 3.10+ (`asyncio`)
-* **Telegram Framework:** [aiogram 3.x](https://github.com/aiogram/aiogram) (FSM, Routers, Inline Callbacks, MemoryStorage)
-* **LLM Engine:** [Google GenAI SDK](https://github.com/google-gemini/google-genai) (Gemini Flash) with Groq API failover
-* **Database:** SQLite 3 (`PRAGMA journal_mode=WAL`)
-* **Parsing & Extraction:** `aiohttp`, `beautifulsoup4`, `pypdf`, `python-docx`
-* **Configuration:** `python-dotenv`
-
----
-
-### 🚀 Step-by-Step Installation & Local Setup
-
-#### 1. Clone the repository
-```bash
-git clone https://github.com/your-username/ai-context-hub.git
-cd ai-context-hub
-```
-
-#### 2. Create and activate a virtual environment
-
-* **Windows:**
-  ```powershell
-  python -m venv venv
-  venv\Scripts\activate
-  ```
-* **Linux / macOS:**
-  ```bash
-  python3 -m venv venv
-  source venv/bin/activate
-  ```
-
-#### 3. Install dependencies
-```bash
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-#### 4. Configure environment variables
+### 4. Configure Environment Variables
 Copy `.env.example` to `.env`:
-* **Windows:**
-  ```cmd
-  copy .env.example .env
-  ```
-* **Linux / macOS:**
-  ```bash
-  cp .env.example .env
-  ```
 
-Fill in your API credentials inside `.env`:
-```ini
-# Bot token from @BotFather
-BOT_TOKEN=your_telegram_bot_token_here
-
-# Google Gemini API key (https://aistudio.google.com/)
-GEMINI_API_KEY=your_gemini_api_key_here
-
-# (Optional) Groq API key for fallback routing (https://console.groq.com/)
-GROQ_API_KEY=your_groq_api_key_here
-
-# (Optional) Comma-separated Telegram User IDs for RBAC whitelist (leave empty for public)
-ALLOWED_USER_IDS=
+On Linux / macOS:
+```bash
+cp .env.example .env
 ```
 
-#### 5. Launch the bot
-* Using Python:
-  ```bash
-  python bot.py
-  ```
-* On Windows using the batch launcher:
-  ```cmd
-  run_bot.bat
-  ```
+On Windows (CMD):
+```cmd
+copy .env.example .env
+```
+
+Define the following environment variables in `.env`:
+
+| Variable | Required | Description |
+|---|---|---|
+| `BOT_TOKEN` | Yes | Telegram Bot API authentication token obtained from BotFather. |
+| `GEMINI_API_KEYS` | Yes | Comma-separated list of Google Gemini API keys used for round-robin rotation. |
+| `GROQ_API_KEY` | Optional | Groq Cloud API key utilized as a failover backend when Gemini quotas are exhausted. |
+| `ALLOWED_USER_IDS` | Optional | Comma-separated Telegram user IDs permitted access. Leave empty for unrestricted access. |
+| `SLIDING_WINDOW_RAW_LIMIT` | Optional | Maximum number of uncompressed raw text payloads retained per user (default: 10). |
+
+Example `.env` configuration:
+```ini
+BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxYZ
+GEMINI_API_KEYS=AIzaSyA1...,AIzaSyB2...,AIzaSyC3...
+GROQ_API_KEY=gsk_your_groq_key_here
+ALLOWED_USER_IDS=123456789,987654321
+SLIDING_WINDOW_RAW_LIMIT=10
+```
+
+### 5. Start the Application
+```bash
+python bot.py
+```
 
 ---
 
-## 📄 License
-This project is open-source and distributed under the [MIT License](LICENSE).
+## Testing and Verification
+
+To verify syntax integrity and validate compilation across all modules, run:
+
+```bash
+python -m py_compile bot.py parser.py llm_router.py locales.py database.py config.py
+```
+
+To execute unit tests for the extraction and routing layers:
+
+```bash
+python test_parser.py
+python test_llm_router.py
+```
+
+---
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.

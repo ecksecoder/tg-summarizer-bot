@@ -29,17 +29,59 @@ BROWSER_USER_AGENT: str = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-# Unified high-density executive summary system prompt in Russian
+# Target language mapping and strict directive builder
+TARGET_LANGUAGE_MAP: dict[str, str] = {
+    "en": "English",
+    "uk": "Ukrainian",
+    "ru": "Russian",
+}
+
+
+def get_target_language_name(target_lang: str = "en") -> str:
+    """Resolve language code to human-readable target language name.
+
+    Args:
+        target_lang: Language code ('en', 'uk', 'ru').
+
+    Returns:
+        str: Mapped language name ('English', 'Ukrainian', 'Russian').
+    """
+    clean = (target_lang or "en").lower().strip()
+    return TARGET_LANGUAGE_MAP.get(clean, "English")
+
+
+def get_target_language_directive(target_lang: str = "en") -> str:
+    """Generate strict target language directive for LLM inference.
+
+    Args:
+        target_lang: Language code ('en', 'uk', 'ru').
+
+    Returns:
+        str: Strict instruction enforcing complete translation-summarization.
+    """
+    target_language_name = get_target_language_name(target_lang)
+    return (
+        f"CRITICAL INSTRUCTION: Analyze the provided content (text, web article, document, or audio) "
+        f"and generate the complete structured executive summary strictly in {target_language_name} "
+        f'(English for "en", Ukrainian for "uk", Russian for "ru"), fully translating and adapting all headings, '
+        f"takeaways, and body text while preserving factual accuracy, proper nouns, and technical metrics."
+    )
+
+
+# Backward-compatible default directive pointing to English
+CRITICAL_LANGUAGE_DIRECTIVE: str = get_target_language_directive("en")
+
+# Unified high-density executive summary system prompt
 UNIFIED_EXECUTIVE_SYSTEM_PROMPT: str = (
     "Ты — ведущий корпоративный аналитик и бизнес-ассистент.\n"
     "Твоя задача — формировать предельно ёмкие, структурированные выжимки (Executive Summary) "
     "из любых предоставленных материалов БЕЗ ВОДЫ, вводных фраз и шаблонных вступлений.\n\n"
+    f"{CRITICAL_LANGUAGE_DIRECTIVE}\n\n"
     "СТРОГО СОБЛЮДАЙ СТРУКТУРУ ВЫВОДА:\n"
     "1. 🎯 Главная суть (1–2 ёмких предложения, передающих ключевой смысл материала).\n"
     "2. 📊 Ключевые факты и цифры (маркированный список важнейших фактов, метрик, аргументов или данных).\n"
     "3. 💡 Практические выводы / Действия (конкретные шаги, инсайты или рекомендации к действию).\n\n"
     "Требования:\n"
-    "- Отвечай исключительно на русском языке.\n"
     "- Используй профессиональный тон, лаконичный Markdown (жирный шрифт для акцентов, списки).\n"
     "- Никаких общих фраз, клише и воды — только факты и практическая ценность."
 )
@@ -871,6 +913,39 @@ class LLMRouter:
         ) from last_error
 
 
+def build_executive_system_prompt(target_lang: str = "en", format_size: str = "MEDIUM") -> str:
+    """Construct full executive system prompt with strict target language directive and compression tier guide.
+
+    Args:
+        target_lang: Target language code ('en', 'uk', 'ru').
+        format_size: Compression tier ('SHORT', 'MEDIUM', 'LONG').
+
+    Returns:
+        str: Fully composed system instruction.
+    """
+    directive = get_target_language_directive(target_lang)
+    target_name = get_target_language_name(target_lang)
+    fmt_key = format_size.upper() if format_size.upper() in FORMAT_INSTRUCTIONS else "MEDIUM"
+    size_guide = FORMAT_INSTRUCTIONS[fmt_key]
+
+    return (
+        f"You are a leading corporate analyst and executive business assistant.\n"
+        f"Your task is to form exceptionally dense, structured executive summaries (Executive Summary) "
+        f"from any provided materials without filler, introductory chatter, or boilerplate phrases.\n\n"
+        f"{directive}\n\n"
+        f"COMPRESSION AND FORMAT GUIDELINES:\n"
+        f"{size_guide}\n\n"
+        f"OUTPUT STRUCTURE REQUIREMENTS:\n"
+        f"1. 🎯 Main Essence / Core Thesis (1–2 dense sentences in {target_name}).\n"
+        f"2. 📊 Key Facts, Figures & Metrics (bulleted list of vital facts, metrics, and arguments in {target_name}).\n"
+        f"3. 💡 Actionable Conclusions / Practical Steps (concrete actions and strategic insights in {target_name}).\n\n"
+        f"Requirements:\n"
+        f"- Use a professional executive tone and concise Markdown (bold accents, clean bullet lists).\n"
+        f"- Fully translate and adapt all headings, takeaways, and body text strictly into {target_name}.\n"
+        f"- No generic fluff, introductory preamble, or empty clichés — only factual accuracy and high practical value."
+    )
+
+
 # Default singleton instances for process-wide sharing
 default_key_manager = KeyManager()
 default_router = LLMRouter(key_manager=default_key_manager)
@@ -887,14 +962,16 @@ async def generate_executive_summary(
     source_title: str = "",
     format_size: str = "MEDIUM",
     retry_variation: bool = False,
+    target_lang: str = "en",
     router: Optional[LLMRouter] = None,
 ) -> str:
-    """Generate high-density Russian Executive Summary across Gemini and Groq cascade.
+    """Generate high-density Executive Summary translated and adapted into target_lang.
 
     Requires:
     (1) Core Essence in 1-2 sentences,
     (2) Key Facts/Metrics as bullet points,
-    (3) Actionable Takeaways.
+    (3) Actionable Takeaways,
+    strictly generated in target_lang ('en', 'uk', 'ru').
 
     Never falls back to dumb character slicing unless both Gemini and Groq completely fail.
 
@@ -903,31 +980,42 @@ async def generate_executive_summary(
         source_title: Source article or document title.
         format_size: Compression tier ('SHORT', 'MEDIUM', 'LONG').
         retry_variation: Whether this is a regenerated variation request.
+        target_lang: Target interface language ('en', 'uk', 'ru').
         router: Optional custom LLMRouter instance.
 
     Returns:
-        str: Formatted markdown Executive Summary.
+        str: Formatted markdown Executive Summary in target_lang.
     """
+    clean_target_lang = (target_lang or "en").lower().strip()
+    if clean_target_lang not in TARGET_LANGUAGE_MAP:
+        clean_target_lang = "en"
+
+    not_enough_text_map = {
+        "en": "⚠️ Could not extract sufficient text from the source.",
+        "uk": "⚠️ Не вдалося вилучити достатній обсяг тексту з джерела.",
+        "ru": "⚠️ Не удалось извлечь достаточный объём текста из источника.",
+    }
     if not raw_text or len(raw_text.strip()) < 10:
-        return "⚠️ Не удалось извлечь достаточный объём текста из источника."
+        return not_enough_text_map.get(clean_target_lang, not_enough_text_map["en"])
 
     # Truncate text safely at 20,000 characters to prevent TPM limit spikes
     prepared_text = _smart_compress_text(raw_text, max_chars=20000)
 
-    fmt_key = format_size.upper() if format_size.upper() in FORMAT_INSTRUCTIONS else "MEDIUM"
-    size_guide = FORMAT_INSTRUCTIONS[fmt_key]
+    variation_notes = {
+        "en": "\nATTENTION: This is a re-analysis! Focus on alternative details, nuanced perspectives, and fresh insights.\n",
+        "uk": "\nУВАГА: Це повторний аналіз! Зроби акцент на альтернативних деталях та неочевидних інсайтах.\n",
+        "ru": "\nВНИМАНИЕ: Это повторный анализ! Сделай упор на альтернативных деталях и неочевидных инсайтах.\n",
+    }
+    variation_note = variation_notes.get(clean_target_lang, variation_notes["en"]) if retry_variation else ""
 
-    variation_note = (
-        "\nВНИМАНИЕ: Это повторный анализ! Сделай упор на альтернативных деталях и неочевидных инсайтах.\n"
-        if retry_variation
-        else ""
-    )
+    target_language_name = get_target_language_name(clean_target_lang)
+    full_system_instruction = build_executive_system_prompt(target_lang=clean_target_lang, format_size=format_size)
 
-    full_system_instruction = f"{UNIFIED_EXECUTIVE_SYSTEM_PROMPT}\n\n{size_guide}"
     user_prompt = (
-        f"ИСТОЧНИК: {source_title or 'Документ'}\n"
+        f"SOURCE: {source_title or 'Document'}\n"
+        f"TARGET LANGUAGE: {target_language_name} ({clean_target_lang})\n"
         f"{variation_note}\n"
-        f"--- НАЧАЛО МАТЕРИАЛА ---\n{prepared_text}\n--- КОНЕЦ МАТЕРИАЛА ---"
+        f"--- START CONTENT ---\n{prepared_text}\n--- END CONTENT ---"
     )
 
     config = types.GenerateContentConfig(
@@ -956,7 +1044,115 @@ async def generate_executive_summary(
         )
 
     # Emergency fallback only when both Gemini and Groq completely fail
-    return _local_extractive_fallback(raw_text, source_title or "Документ")
+    return _local_extractive_fallback(raw_text, source_title or "Document")
+
+
+async def summarize_text(
+    raw_text: str,
+    source_title: str = "",
+    format_size: str = "MEDIUM",
+    retry_variation: bool = False,
+    target_lang: str = "en",
+    router: Optional[LLMRouter] = None,
+) -> str:
+    """Asynchronous text summarization entry point honoring target_lang.
+
+    Args:
+        raw_text: Extracted plain text content.
+        source_title: Source article or document title.
+        format_size: Compression tier ('SHORT', 'MEDIUM', 'LONG').
+        retry_variation: Whether this is a regenerated variation request.
+        target_lang: Target interface language ('en', 'uk', 'ru').
+        router: Optional custom LLMRouter instance.
+
+    Returns:
+        str: Formatted markdown summary in target_lang.
+    """
+    return await generate_executive_summary(
+        raw_text=raw_text,
+        source_title=source_title,
+        format_size=format_size,
+        retry_variation=retry_variation,
+        target_lang=target_lang,
+        router=router,
+    )
+
+
+def process_audio_with_gemini(
+    file_path: str,
+    mime_type: str,
+    source_title: str,
+    format_size: str = "MEDIUM",
+    target_lang: str = "en",
+    lang: Optional[str] = None,
+    client: Optional[genai.Client] = None,
+    router: Optional[LLMRouter] = None,
+) -> str:
+    """Upload audio stream via Google GenAI File API, generate summary in target_lang, and cleanup.
+
+    Args:
+        file_path: Local filesystem path to audio recording.
+        mime_type: Audio MIME type ('audio/ogg', 'audio/mpeg', etc.).
+        source_title: Source label or filename.
+        format_size: Compression tier ('SHORT', 'MEDIUM', 'LONG').
+        target_lang: Target language code ('en', 'uk', 'ru').
+        lang: Backward-compatible alias for target_lang.
+        client: Optional genai.Client instance.
+        router: Optional LLMRouter instance for fallback.
+
+    Returns:
+        str: Formatted summary in target_lang.
+    """
+    effective_lang = (target_lang or lang or "en").lower().strip()
+    if effective_lang not in TARGET_LANGUAGE_MAP:
+        effective_lang = "en"
+
+    active_client = client or default_key_manager.get_client()
+    uploaded_file = None
+    try:
+        fmt_key = format_size.upper() if format_size.upper() in FORMAT_INSTRUCTIONS else "MEDIUM"
+        uploaded_file = active_client.files.upload(
+            file=file_path,
+            config=types.UploadFileConfig(mime_type=mime_type),
+        )
+
+        lang_directive = get_target_language_directive(effective_lang)
+        target_name = get_target_language_name(effective_lang)
+
+        if effective_lang == "ru":
+            task_instruction = f"Внимательно прослушай эту аудиозапись ({source_title}) и сформируй структурированную выжимку строго на русском языке."
+        elif effective_lang == "uk":
+            task_instruction = f"Уважно прослухай цей аудіозапис ({source_title}) та сформуй структуровану вижимку строго українською мовою."
+        else:
+            task_instruction = f"Listen carefully to this audio recording ({source_title}) and generate a structured executive summary strictly in English."
+
+        prompt = (
+            f"You are a leading corporate analyst and executive business assistant.\n\n"
+            f"{lang_directive}\n\n"
+            f"{FORMAT_INSTRUCTIONS[fmt_key]}\n\n"
+            f"STRICTLY ADHERE TO OUTPUT STRUCTURE:\n"
+            f"1. 🎯 Main Essence / Core Thesis (1-2 dense sentences in {target_name}).\n"
+            f"2. 📊 Key Facts, Figures & Metrics (bulleted list in {target_name}).\n"
+            f"3. 💡 Actionable Conclusions / Practical Steps (in {target_name}).\n\n"
+            f"{task_instruction}"
+        )
+
+        active_router = router or default_router
+        try:
+            response = active_router.generate_content_sync(
+                contents=[uploaded_file, prompt],
+                temperature=0.25,
+            )
+            return str(response).strip()
+        except Exception as exc:
+            logger.error("[Audio Pipeline] Generation failed: %s", exc)
+            raise RuntimeError(f"Audio summarization failed across cascade: {exc}") from exc
+    finally:
+        if uploaded_file:
+            try:
+                active_client.files.delete(name=uploaded_file.name)
+            except Exception:
+                pass
 
 
 def summarize_with_gemini(
@@ -964,6 +1160,7 @@ def summarize_with_gemini(
     source_title: str,
     format_size: str = "MEDIUM",
     retry_variation: bool = False,
+    target_lang: str = "en",
 ) -> str:
     """Synchronous backward-compatible bridge for executive summary generation.
 
@@ -972,6 +1169,7 @@ def summarize_with_gemini(
         source_title: Source article or document title.
         format_size: Compression tier ('SHORT', 'MEDIUM', 'LONG').
         retry_variation: Whether this is a regenerated variation request.
+        target_lang: Target interface language ('en', 'uk', 'ru').
 
     Returns:
         str: Formatted markdown summary.
@@ -984,10 +1182,24 @@ def summarize_with_gemini(
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 return pool.submit(
                     asyncio.run,
-                    generate_executive_summary(raw_text, source_title, format_size, retry_variation),
+                    generate_executive_summary(
+                        raw_text,
+                        source_title,
+                        format_size,
+                        retry_variation,
+                        target_lang=target_lang,
+                    ),
                 ).result()
         return loop.run_until_complete(
-            generate_executive_summary(raw_text, source_title, format_size, retry_variation)
+            generate_executive_summary(
+                raw_text,
+                source_title,
+                format_size,
+                retry_variation,
+                target_lang=target_lang,
+            )
         )
+    except Exception:
+        return _local_extractive_fallback(raw_text, source_title)
     except Exception:
         return _local_extractive_fallback(raw_text, source_title)
